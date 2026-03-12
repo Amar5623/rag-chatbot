@@ -37,38 +37,222 @@ from config import QDRANT_PATH, QDRANT_COLLECTION
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap');
+
 html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+
 .stApp { background: #0a0a0f; color: #e8e6e3; }
-section[data-testid="stSidebar"] { background: #0f0f18 !important; border-right: 1px solid #1e1e2e; }
-section[data-testid="stSidebar"] label, section[data-testid="stSidebar"] p, section[data-testid="stSidebar"] span { color: #a09fbb !important; font-size: 0.82rem; }
-.rag-logo { font-family: 'Syne', sans-serif; font-weight: 800; font-size: 1.6rem; background: linear-gradient(135deg, #c9a96e 0%, #f0d5a0 50%, #c9a96e 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; line-height: 1.1; }
-.rag-subtitle { font-size: 0.72rem; color: #504f6a; letter-spacing: 0.12em; text-transform: uppercase; margin-top: 2px; margin-bottom: 20px; }
-.sidebar-section { font-family: 'Syne', sans-serif; font-size: 0.65rem; font-weight: 700; letter-spacing: 0.18em; text-transform: uppercase; color: #c9a96e; margin: 18px 0 8px 0; padding-bottom: 4px; border-bottom: 1px solid #1e1e2e; }
-.msg-user { background: linear-gradient(135deg, #1a1a2e, #16213e); border: 1px solid #2a2a4a; border-radius: 16px 16px 4px 16px; padding: 14px 18px; margin-left: 15%; color: #e8e6e3; font-size: 0.94rem; line-height: 1.6; margin-bottom: 12px; }
-.msg-assistant { background: linear-gradient(135deg, #111118, #13131f); border: 1px solid #1e1e30; border-left: 3px solid #c9a96e; border-radius: 4px 16px 16px 16px; padding: 14px 18px; margin-right: 15%; color: #d4d2cf; font-size: 0.94rem; line-height: 1.7; margin-bottom: 12px; }
-.msg-label { font-family: 'Syne', sans-serif; font-size: 0.65rem; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 6px; }
+
+section[data-testid="stSidebar"] {
+    background: #0f0f18 !important;
+    border-right: 1px solid #1e1e2e;
+}
+
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] span {
+    color: #a09fbb !important;
+    font-size: 0.82rem;
+}
+
+.rag-logo {
+    font-family: 'Syne', sans-serif;
+    font-weight: 800;
+    font-size: 1.6rem;
+    background: linear-gradient(135deg, #c9a96e 0%, #f0d5a0 50%, #c9a96e 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+.rag-subtitle {
+    font-size: 0.72rem;
+    color: #504f6a;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-top: 2px;
+    margin-bottom: 20px;
+}
+
+.sidebar-section {
+    font-family: 'Syne', sans-serif;
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: #c9a96e;
+    margin: 18px 0 8px 0;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #1e1e2e;
+}
+
+.msg-user {
+    background: linear-gradient(135deg, #1a1a2e, #16213e);
+    border: 1px solid #2a2a4a;
+    border-radius: 16px 16px 4px 16px;
+    padding: 14px 18px;
+    margin-left: 15%;
+    color: #e8e6e3;
+    font-size: 0.94rem;
+    line-height: 1.6;
+    margin-bottom: 12px;
+}
+
+.msg-assistant {
+    background: linear-gradient(135deg, #111118, #13131f);
+    border: 1px solid #1e1e30;
+    border-left: 3px solid #c9a96e;
+    border-radius: 4px 16px 16px 16px;
+    padding: 14px 18px;
+    margin-right: 15%;
+    color: #d4d2cf;
+    font-size: 0.94rem;
+    line-height: 1.7;
+    margin-bottom: 12px;
+}
+
+.msg-label {
+    font-family: 'Syne', sans-serif;
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+}
+
 .msg-label-user { color: #5c5b7a; }
 .msg-label-assistant { color: #c9a96e; }
-.citations-box { margin-top: 12px; padding: 10px 14px; background: #0d0d16; border: 1px solid #1a1a28; border-radius: 8px; font-size: 0.78rem; color: #6b6a88; }
-.citations-box strong { color: #c9a96e; font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase; }
-.cite-item { display: inline-block; background: #161624; border: 1px solid #252538; border-radius: 4px; padding: 2px 8px; margin: 2px 3px; font-size: 0.75rem; color: #8a89a8; }
-.welcome-title { font-family: 'Syne', sans-serif; font-size: 2.2rem; font-weight: 800; background: linear-gradient(135deg, #c9a96e, #f0d5a0, #c9a96e); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; letter-spacing: -0.03em; }
-.feature-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 20px; }
-.feature-card { background: #0f0f18; border: 1px solid #1e1e2e; border-radius: 10px; padding: 14px 16px; }
-.feature-title { font-family: 'Syne', sans-serif; font-size: 0.78rem; font-weight: 700; color: #c9a96e; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
-.feature-desc { font-size: 0.78rem; color: #504f6a; line-height: 1.5; }
-.status-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 0.72rem; padding: 3px 10px; border-radius: 20px; font-family: 'Syne', sans-serif; font-weight: 600; letter-spacing: 0.06em; }
-.status-ready   { background:#0d2010; border:1px solid #1a4020; color:#4caf70; }
+
+.citations-box {
+    margin-top: 12px;
+    padding: 10px 14px;
+    background: #0d0d16;
+    border: 1px solid #1a1a28;
+    border-radius: 8px;
+    font-size: 0.78rem;
+    color: #6b6a88;
+}
+
+.citations-box strong {
+    color: #c9a96e;
+    font-size: 0.7rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+}
+
+.cite-item {
+    display: inline-block;
+    background: #161624;
+    border: 1px solid #252538;
+    border-radius: 4px;
+    padding: 2px 8px;
+    margin: 2px 3px;
+    font-size: 0.75rem;
+    color: #8a89a8;
+}
+
+/* NEW: heading shown below each citation badge */
+.cite-heading {
+    font-size: 0.68rem;
+    color: #504f6a;
+    font-style: italic;
+}
+
+.welcome-title {
+    font-family: 'Syne', sans-serif;
+    font-size: 2.2rem;
+    font-weight: 800;
+    background: linear-gradient(135deg, #c9a96e, #f0d5a0, #c9a96e);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+.feature-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-top: 20px;
+}
+
+.feature-card {
+    background: #0f0f18;
+    border: 1px solid #1e1e2e;
+    border-radius: 10px;
+    padding: 14px 16px;
+}
+
+.feature-title {
+    font-family: 'Syne', sans-serif;
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: #c9a96e;
+}
+
+.feature-desc {
+    font-size: 0.78rem;
+    color: #504f6a;
+}
+
+.status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.72rem;
+    padding: 3px 10px;
+    border-radius: 20px;
+}
+
+.status-ready { background:#0d2010; border:1px solid #1a4020; color:#4caf70; }
 .status-loading { background:#1a1000; border:1px solid #3a2800; color:#c9a96e; }
-.kb-badge { background:#0d1520; border:1px solid #1a3040; color:#5aaacc; display:inline-flex; align-items:center; gap:5px; font-size:0.72rem; padding:3px 10px; border-radius:20px; font-family:'Syne',sans-serif; font-weight:600; }
-.metric-pill { background: #0f0f18; border: 1px solid #1e1e2e; border-radius: 6px; padding: 6px 12px; font-size: 0.75rem; color: #6b6a88; margin-top: 5px; }
+
+.kb-badge {
+    background:#0d1520;
+    border:1px solid #1a3040;
+    color:#5aaacc;
+    padding:3px 10px;
+    border-radius:20px;
+}
+
+.metric-pill {
+    background: #0f0f18;
+    border: 1px solid #1e1e2e;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 0.75rem;
+    color: #6b6a88;
+}
+
 .metric-pill span { color: #c9a96e; font-weight: 600; }
-.stTextInput > div > div > input { background: #0f0f18 !important; border: 1px solid #1e1e2e !important; border-radius: 10px !important; color: #e8e6e3 !important; }
-.stTextInput > div > div > input:focus { border-color: #c9a96e !important; box-shadow: 0 0 0 1px #c9a96e33 !important; }
-.stButton > button { background: linear-gradient(135deg, #c9a96e, #a8854a) !important; color: #0a0a0f !important; font-family: 'Syne', sans-serif !important; font-weight: 700 !important; font-size: 0.78rem !important; letter-spacing: 0.08em !important; text-transform: uppercase !important; border: none !important; border-radius: 8px !important; }
-hr { border-color: #1e1e2e !important; }
-::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: #0a0a0f; } ::-webkit-scrollbar-thumb { background: #2a2a3e; border-radius: 2px; }
-#MainMenu, footer, header { visibility: hidden; } .stDeployButton { display: none; }
+
+.stTextInput input {
+    background: #0f0f18 !important;
+    border: 1px solid #1e1e2e !important;
+    border-radius: 10px !important;
+    color: #e8e6e3 !important;
+}
+
+.stButton > button {
+    background: linear-gradient(135deg, #c9a96e, #a8854a) !important;
+    color: #0a0a0f !important;
+    font-family: 'Syne', sans-serif !important;
+    font-weight: 700 !important;
+    border-radius: 8px !important;
+}
+
+/* NEW: image result box shown below assistant answers */
+.image-result-label {
+    font-family: 'Syne', sans-serif;
+    font-size: 0.65rem;
+    font-weight: 700;
+    color: #5aaacc;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 6px;
+}
+
+footer {visibility: hidden;}
+
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-thumb { background: #2a2a3e; border-radius: 2px; }
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -240,6 +424,7 @@ with st.sidebar:
         st.markdown("---")
         c1, c2 = st.columns(2)
         with c1:
+            # Full reset: clears sliding window AND entity memory
             if st.button("🔄 Clear Chat", use_container_width=True):
                 st.session_state.messages = []
                 st.session_state.chain.reset_memory()
@@ -250,6 +435,12 @@ with st.sidebar:
                 st.session_state.chain = None
                 st.rerun()
 
+        # NEW: clears chat turns but keeps entity memory facts alive
+        if st.button("🧠 Clear Chat (keep facts)", use_container_width=True):
+            st.session_state.messages = []
+            st.session_state.chain.llm.history.clear_turns_only()
+            st.rerun()
+
     # ── Stats ─────────────────────────────
     if st.session_state.chain_ready:
         st.markdown('<div class="sidebar-section">📊 Stats</div>', unsafe_allow_html=True)
@@ -258,6 +449,7 @@ with st.sidebar:
             ("KB chunks",    st.session_state.total_chunks),
             ("Files loaded", len(st.session_state.indexed_files)),
             ("Chat turns",   info["history_turns"]),
+            ("Entity facts", info.get("entity_facts", 0)),  # NEW
             ("Model",        info["llm"]["model"].split("-")[0] + "…"),
         ]:
             st.markdown(f'<div class="metric-pill">{label} <span>{val}</span></div>', unsafe_allow_html=True)
@@ -369,8 +561,8 @@ if not st.session_state.chain_ready:
             <div class="feature-card"><div class="feature-title">➕ Incremental Add</div><div class="feature-desc">Add new files to your KB without wiping existing knowledge.</div></div>
             <div class="feature-card"><div class="feature-title">🔍 Hybrid Retrieval</div><div class="feature-desc">BM25 keyword + dense semantic search fused with RRF.</div></div>
             <div class="feature-card"><div class="feature-title">🎯 Reranking</div><div class="feature-desc">Cross-encoder precision reranking on top of retrieval.</div></div>
-            <div class="feature-card"><div class="feature-title">🧠 Memory</div><div class="feature-desc">Multi-turn conversation memory across your session.</div></div>
-            <div class="feature-card"><div class="feature-title">📎 Citations</div><div class="feature-desc">Every answer cites the exact source file and page.</div></div>
+            <div class="feature-card"><div class="feature-title">🧠 Smart Memory</div><div class="feature-desc">Sliding window + entity memory for long conversations.</div></div>
+            <div class="feature-card"><div class="feature-title">🖼️ Image Responses</div><div class="feature-desc">Retrieved images displayed alongside answers.</div></div>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -379,22 +571,60 @@ else:
     # ── Chat history ──────────────────────
     for msg in st.session_state.messages:
         if msg["role"] == "user":
-            st.markdown(f'<div class="msg-user"><div class="msg-label msg-label-user">You</div>{msg["content"]}</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="msg-user"><div class="msg-label msg-label-user">You</div>'
+                f'{msg["content"]}</div>',
+                unsafe_allow_html=True
+            )
         else:
+            # ── Build citations HTML with type icon + heading ──
             citations_html = ""
             if msg.get("citations"):
-                items = "".join(
-                    f'<span class="cite-item">📄 {c["source"]} p.{c["page"]}</span>'
-                    for c in msg["citations"]
-                )
+                items = ""
+                for c in msg["citations"]:
+                    # pick icon based on content type
+                    icon = "🖼️" if c.get("type") == "image" else ("📊" if c.get("type") == "table" else "📄")
+                    # show section heading if available
+                    heading_part = (
+                        f' <span class="cite-heading">· {c["heading"]}</span>'
+                        if c.get("heading") else ""
+                    )
+                    items += (
+                        f'<span class="cite-item">'
+                        f'{icon} {c["source"]} p.{c["page"]}'
+                        f'{heading_part}'
+                        f'</span>'
+                    )
                 citations_html = f'<div class="citations-box"><strong>Sources</strong><br>{items}</div>'
+
             usage = msg.get("usage", {})
-            tokens_html = f'<div style="margin-top:6px;font-size:0.7rem;color:#2e2e46;">{usage["total_tokens"]} tokens</div>' if usage.get("total_tokens") else ""
+            tokens_html = (
+                f'<div style="margin-top:6px;font-size:0.7rem;color:#2e2e46;">'
+                f'{usage["total_tokens"]} tokens</div>'
+            ) if usage.get("total_tokens") else ""
+
             st.markdown(
                 f'<div class="msg-assistant"><div class="msg-label msg-label-assistant">Assistant</div>'
                 f'{msg["content"]}{citations_html}{tokens_html}</div>',
                 unsafe_allow_html=True
             )
+
+            # Display retrieved images — constrained width, clean UI
+            if msg.get("image_paths"):
+                for img_path in msg["image_paths"]:
+                    if os.path.exists(img_path):
+                        # Left column = image (60%), right = whitespace
+                        img_col, _ = st.columns([3, 2])
+                        with img_col:
+                            st.markdown(
+                                '<div class="image-result-label">🖼️ Referenced Image</div>',
+                                unsafe_allow_html=True
+                            )
+                            st.image(
+                                img_path,
+                                caption=f"Source: {os.path.basename(img_path)}",
+                                width=460,
+                            )
 
     # ── Input ────────────────────────────
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
@@ -412,6 +642,7 @@ else:
         placeholder = st.empty()
         full_answer = []
         citations   = []
+        image_paths = []   # NEW
         usage       = {}
 
         for chunk in st.session_state.chain.stream(question):
@@ -423,12 +654,17 @@ else:
                     unsafe_allow_html=True
                 )
             else:
-                citations = chunk.get_citations()
-                usage     = chunk.usage
+                # Final ChainResponse — pull citations, images, usage
+                citations   = chunk.get_citations()
+                image_paths = chunk.get_images()   # NEW
+                usage       = chunk.usage
 
         placeholder.empty()
         st.session_state.messages.append({
-            "role": "assistant", "content": "".join(full_answer),
-            "citations": citations, "usage": usage,
+            "role"       : "assistant",
+            "content"    : "".join(full_answer),
+            "citations"  : citations,
+            "image_paths": image_paths,            # NEW
+            "usage"      : usage,
         })
         st.rerun()

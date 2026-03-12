@@ -1,15 +1,19 @@
 # chains/rag_chain.py
+# IMPROVED:
+#   - ChainResponse now carries image_paths from retrieved image chunks
+#   - get_images() method lets app.py display images alongside answers
+#   - heading metadata shown in citations for better source context
 
 import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from retrieval.naive_retriever import NaiveRetriever, RetrievalResult
+from retrieval.naive_retriever  import NaiveRetriever, RetrievalResult
 from retrieval.hybrid_retriever import HybridRetriever
-from retrieval.reranker import Reranker
-from generation.groq_llm import BaseLLM, ChatHistory, LLMFactory
-from vectorstore.qdrant_store import QdrantVectorStore, BaseVectorStore
-from embeddings.embedder import EmbedderFactory
+from retrieval.reranker         import Reranker
+from generation.groq_llm        import BaseLLM, ChatHistory, LLMFactory
+from vectorstore.qdrant_store   import QdrantVectorStore, BaseVectorStore
+from embeddings.embedder        import EmbedderFactory
 from config import TOP_K
 
 
@@ -25,7 +29,8 @@ Rules:
 - If the context does not contain enough information, say: \
 "I don't have enough information in the provided documents to answer that."
 - Be concise and precise.
-- When relevant, mention which source your answer comes from."""
+- When relevant, mention which source your answer comes from.
+- If the context contains image descriptions or OCR text, reference them naturally."""
 
 RAG_USER_TEMPLATE = """\
 Context:
@@ -49,7 +54,11 @@ After your answer, list the sources you used on a new line starting with "Source
 class ChainResponse:
     """
     Wraps the full output of a RAG chain call.
-    Contains the answer, retrieved chunks, and citations.
+
+    IMPROVED vs original:
+      - get_images() returns list of image paths from retrieved image chunks
+        so app.py can display the actual images in the response
+      - get_citations() now includes heading for richer source display
     """
 
     def __init__(
@@ -70,10 +79,45 @@ class ChainResponse:
         return self.answer
 
     def get_citations(self) -> list[dict]:
-        return self.retrieval.get_citations()
+        """
+        Returns citation dicts with source, page, heading, type.
+        Heading lets the UI show which section the answer came from.
+        """
+        citations = []
+        for chunk in self.retrieval.get_chunks():
+            citations.append({
+                "source" : chunk.get("source", "unknown"),
+                "page"   : chunk.get("page", "?"),
+                "heading": chunk.get("heading", ""),
+                "type"   : chunk.get("type", "text"),
+            })
+        return citations
+
+    def get_images(self) -> list[str]:
+        """
+        NEW: Return absolute paths of any images retrieved as context.
+        app.py uses this to display images alongside the LLM answer.
+
+        Only returns paths that actually exist on disk.
+        """
+        paths = []
+        for chunk in self.retrieval.get_chunks():
+            if chunk.get("type") == "image":
+                img_path = chunk.get("image_path", "")
+                if img_path and os.path.exists(img_path):
+                    paths.append(img_path)
+        return paths
+
+    def has_images(self) -> bool:
+        return len(self.get_images()) > 0
 
     def format_citations(self) -> str:
-        return self.retrieval.format_citations()
+        """Plain-text formatted citations string."""
+        lines = []
+        for c in self.get_citations():
+            heading_part = f" [{c['heading']}]" if c.get("heading") else ""
+            lines.append(f"  • {c['source']} (p.{c['page']}){heading_part}")
+        return "Sources:\n" + "\n".join(lines) if lines else ""
 
     def get_chunks(self) -> list[dict]:
         return self.retrieval.get_chunks()
@@ -83,9 +127,9 @@ class ChainResponse:
 
     def __str__(self) -> str:
         parts = [self.answer]
-        citations = self.format_citations()
-        if citations:
-            parts.append("\n" + citations)
+        cites = self.format_citations()
+        if cites:
+            parts.append("\n" + cites)
         return "\n".join(parts)
 
     def __repr__(self) -> str:
@@ -93,6 +137,7 @@ class ChainResponse:
             f"ChainResponse("
             f"model={self.model}, "
             f"chunks={len(self.retrieval)}, "
+            f"images={len(self.get_images())}, "
             f"tokens={self.usage.get('total_tokens', '?')})"
         )
 
@@ -105,29 +150,10 @@ class RAGChain:
     """
     Full RAG pipeline: Retrieve → Rerank → Generate.
 
-    Default pipeline:
-        HybridRetriever (dense + BM25 + RRF)
-            → Reranker (cross-encoder)
-                → LLM (Groq or Ollama)
-
-    Features:
-        ✅ Multi-turn conversation memory
-        ✅ Source citations in answers
-        ✅ Streaming responses
-        ✅ Configurable retriever and LLM
-        ✅ Optional reranking
-
-    Usage:
-        chain = RAGChain()
-        chain.index_documents(chunks)
-
-        # Single turn
-        response = chain.ask("What was Q1 revenue?")
-        print(response)
-
-        # Streaming
-        for chunk in chain.stream("What was Q1 revenue?"):
-            print(chunk, end="", flush=True)
+    IMPROVED vs original:
+      - ChainResponse.get_images() exposes image paths to the UI
+      - Citations include heading metadata for section-level attribution
+      - Memory: sliding window (10 turns) + entity memory (whole session)
     """
 
     def __init__(
@@ -137,8 +163,8 @@ class RAGChain:
         retriever                       = None,
         reranker      : Reranker        = None,
         use_reranker  : bool            = True,
-        retrieve_top_k: int             = 20,    # fetch wide before rerank
-        rerank_top_k  : int             = 5,     # keep narrow after rerank
+        retrieve_top_k: int             = 20,
+        rerank_top_k  : int             = 5,
         cite_sources  : bool            = True,
         llm_provider  : str             = "groq",
     ):
@@ -147,8 +173,8 @@ class RAGChain:
         self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
 
         # ── Vector store ──────────────────────
-        embedder     = EmbedderFactory.get("huggingface")
-        self.store   = vector_store or QdrantVectorStore(embedder=embedder)
+        embedder   = EmbedderFactory.get("huggingface")
+        self.store = vector_store or QdrantVectorStore(embedder=embedder)
 
         # ── Retriever ─────────────────────────
         if retriever is not None:
@@ -169,9 +195,8 @@ class RAGChain:
         self.retrieve_top_k = retrieve_top_k
         self.cite_sources   = cite_sources
 
-        # ── Conversation memory ───────────────
-        # Shared ChatHistory — persists across ask() calls
-        self.history = self.llm.history
+        # ── Memory ────────────────────────────
+        self.history = self.llm.history   # sliding window + entity memory
 
         print(f"\n  [RAG CHAIN] ✅ Ready!")
         print(f"  [RAG CHAIN] LLM       : {self.llm.model_name}")
@@ -182,40 +207,26 @@ class RAGChain:
     # ── INDEXING ─────────────────────────────
 
     def index_documents(self, chunks: list[dict]) -> None:
-        """
-        Add document chunks to both the vector store and BM25 index.
-        Call this once after ingesting your documents.
-
-        Args:
-            chunks : list of dicts with at least a 'content' key
-        """
         self.store.add_documents(chunks)
-
-        # Build BM25 index if retriever supports it
         if hasattr(self.retriever, "index_chunks"):
             self.retriever.index_chunks(chunks)
-
         print(f"  [RAG CHAIN] Indexed {len(chunks)} chunks.")
 
     # ── RETRIEVAL ────────────────────────────
 
     def _retrieve(self, question: str) -> RetrievalResult:
-        """Run retrieval + optional reranking."""
         retrieval = self.retriever.retrieve(question)
-
         if self.use_reranker and self.reranker and len(retrieval) > 0:
             retrieval = self.reranker.rerank(
                 query     = question,
                 retrieval = retrieval,
                 top_k     = self.rerank_top_k,
             )
-
         return retrieval
 
     # ── PROMPT BUILDING ──────────────────────
 
     def _build_prompt(self, question: str, context: str) -> str:
-        """Format the user prompt with context injected."""
         template = (
             RAG_USER_TEMPLATE_WITH_CITATIONS
             if self.cite_sources
@@ -225,47 +236,19 @@ class RAGChain:
 
     # ── ASK (blocking) ───────────────────────
 
-    def ask(
-        self,
-        question      : str,
-        top_k         : int  = None,
-        cite_sources  : bool = None,
-    ) -> ChainResponse:
-        """
-        Full RAG pipeline — blocking, returns complete ChainResponse.
-
-        Args:
-            question     : user question
-            top_k        : override rerank_top_k for this call
-            cite_sources : override chain default for this call
-
-        Returns:
-            ChainResponse with answer, chunks, citations, usage
-        """
-        cite    = cite_sources if cite_sources is not None else self.cite_sources
-        rerank_k = top_k or self.rerank_top_k
-
-        # ── Step 1: Retrieve + Rerank ──
+    def ask(self, question: str, top_k: int = None, cite_sources: bool = None) -> ChainResponse:
         retrieval = self._retrieve(question)
         context   = retrieval.to_context_string()
 
         if not context.strip():
             answer = "I don't have enough information in the provided documents to answer that."
             return ChainResponse(
-                answer    = answer,
-                retrieval = retrieval,
-                question  = question,
-                model     = self.llm.model_name,
+                answer=answer, retrieval=retrieval,
+                question=question, model=self.llm.model_name,
             )
 
-        # ── Step 2: Build prompt ──
         prompt = self._build_prompt(question, context)
-
-        # ── Step 3: Generate ──
-        result = self.llm.generate(
-            prompt  = prompt,
-            history = self.history,
-        )
+        result = self.llm.generate(prompt=prompt, history=self.history)
 
         return ChainResponse(
             answer    = result["content"],
@@ -275,31 +258,16 @@ class RAGChain:
             usage     = result["usage"],
         )
 
-    # ── STREAM ───────────────────────────────
+    # ── STREAM (generator) ───────────────────
 
-    def stream(
-        self,
-        question     : str,
-        cite_sources : bool = None,
-    ):
+    def stream(self, question: str, cite_sources: bool = None):
         """
-        Streaming RAG pipeline — yields text chunks then a final ChainResponse.
-
-        Usage:
-            for chunk in chain.stream("What was Q1 revenue?"):
-                if isinstance(chunk, str):
-                    print(chunk, end="", flush=True)
-                else:
-                    print()
-                    print(chunk.format_citations())
+        Streaming RAG pipeline.
 
         Yields:
-            str          — text tokens as they stream
-            ChainResponse — final item with full metadata
+            str           — text tokens as they stream
+            ChainResponse — final item with full metadata + image paths
         """
-        cite = cite_sources if cite_sources is not None else self.cite_sources
-
-        # ── Step 1: Retrieve + Rerank ──
         retrieval = self._retrieve(question)
         context   = retrieval.to_context_string()
 
@@ -307,17 +275,12 @@ class RAGChain:
             answer = "I don't have enough information in the provided documents to answer that."
             yield answer
             yield ChainResponse(
-                answer    = answer,
-                retrieval = retrieval,
-                question  = question,
-                model     = self.llm.model_name,
+                answer=answer, retrieval=retrieval,
+                question=question, model=self.llm.model_name,
             )
             return
 
-        # ── Step 2: Build prompt ──
-        prompt = self._build_prompt(question, context)
-
-        # ── Step 3: Stream ──
+        prompt     = self._build_prompt(question, context)
         full_reply = []
         usage      = {}
 
@@ -328,7 +291,6 @@ class RAGChain:
             else:
                 usage = chunk.get("usage", {})
 
-        # ── Final ChainResponse ──
         yield ChainResponse(
             answer    = "".join(full_reply),
             retrieval = retrieval,
@@ -340,26 +302,26 @@ class RAGChain:
     # ── MEMORY ───────────────────────────────
 
     def reset_memory(self) -> None:
-        """Clear conversation history, keep system prompt and chain config."""
+        """Clear both sliding window AND entity memory."""
         self.llm.reset_history()
-        print("  [RAG CHAIN] Conversation memory cleared.")
+        print("  [RAG CHAIN] Memory fully cleared.")
 
     def get_history(self) -> list[dict]:
-        """Return raw message history list."""
         return self.history.to_messages()
 
     # ── INFO ─────────────────────────────────
 
     def get_info(self) -> dict:
         return {
-            "llm"          : self.llm.get_info(),
-            "retriever"    : type(self.retriever).__name__,
-            "reranker"     : self.reranker.get_info() if self.reranker else None,
-            "retrieve_top_k": self.retrieve_top_k,
-            "rerank_top_k" : self.rerank_top_k,
-            "cite_sources" : self.cite_sources,
-            "history_turns": len(self.history),
-            "vector_store" : self.store.get_stats(),
+            "llm"            : self.llm.get_info(),
+            "retriever"      : type(self.retriever).__name__,
+            "reranker"       : self.reranker.get_info() if self.reranker else None,
+            "retrieve_top_k" : self.retrieve_top_k,
+            "rerank_top_k"   : self.rerank_top_k,
+            "cite_sources"   : self.cite_sources,
+            "history_turns"  : len(self.history),
+            "entity_facts"   : len(self.history.entity_memory),
+            "vector_store"   : self.store.get_stats(),
         }
 
 

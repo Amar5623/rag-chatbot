@@ -1,4 +1,6 @@
 # ingestion/chunker.py
+# IMPROVED: adds total_chunks to every chunk so retrieval can do
+#           context-window expansion (fetch neighbours by chunk_index)
 
 import os
 import sys
@@ -35,21 +37,33 @@ class BaseChunker:
     def chunk_documents(self, docs: list[dict]) -> list[dict]:
         """
         Takes a list of loader chunks (dicts with 'content')
-        and re-chunks each one, preserving metadata.
+        and re-chunks each one, preserving ALL metadata.
+
+        IMPROVED vs original:
+          - Adds total_chunks so retrieval knows how many siblings exist
+          - Preserves heading metadata injected by pdf_loader
+          - Tables / images / csv / xlsx are kept as-is (no re-chunking)
         """
         result = []
         for doc in docs:
-            # Tables, images, csv, xlsx → don't re-chunk, keep as-is
-            if doc["type"] in ["table", "image", "csv", "xlsx"]:
+            # ── Structured content — keep atomic, never re-chunk ──
+            if doc.get("type") in ["table", "image", "csv", "xlsx"]:
+                # Still tag with chunk_index / total so schema is consistent
+                doc["chunk_index"]  = 0
+                doc["total_chunks"] = 1
+                doc["strategy"]     = "none"
                 result.append(doc)
                 continue
 
-            # Re-chunk text content
+            # ── Text content — split it ──
             sub_chunks = self.chunk(doc["content"])
+            total      = len(sub_chunks)           # ← know total BEFORE the loop
+
             for i, sub in enumerate(sub_chunks):
-                new_doc = doc.copy()
+                new_doc = doc.copy()               # preserve all loader metadata
                 new_doc["content"]      = sub
-                new_doc["chunk_index"]  = i
+                new_doc["chunk_index"]  = i        # position inside this document
+                new_doc["total_chunks"] = total    # NEW: how many siblings exist
                 new_doc["strategy"]     = self.strategy_name
                 result.append(new_doc)
 
@@ -61,11 +75,11 @@ class BaseChunker:
             return {}
         lengths = [len(c) for c in chunks]
         return {
-            "strategy"   : self.strategy_name,
+            "strategy"    : self.strategy_name,
             "total_chunks": len(chunks),
-            "avg_length" : round(sum(lengths) / len(lengths)),
-            "min_length" : min(lengths),
-            "max_length" : max(lengths),
+            "avg_length"  : round(sum(lengths) / len(lengths)),
+            "min_length"  : min(lengths),
+            "max_length"  : max(lengths),
         }
 
 
@@ -136,8 +150,8 @@ class SemanticChunkerWrapper(BaseChunker):
         print("  [SEMANTIC] Loading embedding model for chunking...")
         embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
         self.splitter = SemanticChunker(
-            embeddings              = embeddings,
-            breakpoint_threshold_type = "percentile"  # splits on biggest meaning shifts
+            embeddings                = embeddings,
+            breakpoint_threshold_type = "percentile"
         )
 
     def chunk(self, text: str) -> list[str]:
@@ -146,15 +160,10 @@ class SemanticChunkerWrapper(BaseChunker):
 
 
 # ─────────────────────────────────────────
-# CHUNKER FACTORY — pick strategy by name
+# CHUNKER FACTORY
 # ─────────────────────────────────────────
 
 class ChunkerFactory:
-    """
-    Factory class — returns the right chunker based on strategy name.
-    Makes it easy to switch strategies from the Streamlit UI.
-    """
-
     STRATEGIES = {
         "fixed"    : FixedSizeChunker,
         "recursive": RecursiveChunker,
@@ -163,20 +172,13 @@ class ChunkerFactory:
 
     @staticmethod
     def get(strategy: str = "recursive", **kwargs) -> BaseChunker:
-        """
-        Usage:
-            chunker = ChunkerFactory.get("recursive", chunk_size=500)
-        """
         strategy = strategy.lower()
         if strategy not in ChunkerFactory.STRATEGIES:
             raise ValueError(
                 f"Unknown strategy '{strategy}'. "
                 f"Choose from: {list(ChunkerFactory.STRATEGIES.keys())}"
             )
-
         cls = ChunkerFactory.STRATEGIES[strategy]
-
-        # SemanticChunker takes no size args
         if strategy == "semantic":
             return cls()
         return cls(**kwargs)
