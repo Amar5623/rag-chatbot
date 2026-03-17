@@ -5,3 +5,4 @@ qdrant_local_db/
 .env
 bm25_index.pkl
 parent_store.pkl
+extracted_images/
