@@ -1,6 +1,7 @@
-.env
+node_modules
 __pycache__
 .venv
-data/*
-qdrant_local_db
-extracted_images/*
+qdrant_local_db/
+.env
+bm25_index.pkl
+parent_store.pkl
