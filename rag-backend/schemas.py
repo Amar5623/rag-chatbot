@@ -66,9 +66,14 @@ class WipeResponse(BaseModel):
     status  : str
     message : str
 
+class IngestStatusResponse(BaseModel):
+    status  : str
+    progress: int = 0
+    message : str = ""
+    result  : dict = {}
 
 __all__ = [
     "ChatRequest", "ClearRequest",
     "Citation", "ChatResponse", "IngestResponse",
-    "StatsResponse", "HealthResponse", "DocumentsResponse", "WipeResponse",
+    "StatsResponse", "HealthResponse", "DocumentsResponse", "WipeResponse", "IngestStatusResponse"
 ]

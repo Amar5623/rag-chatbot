@@ -28,12 +28,22 @@ export async function fetchDocuments() {
 export async function ingestFiles(files) {
   const form = new FormData()
   for (const f of files) form.append('files', f)
+
   const res = await fetch(`${BASE}/ingest`, { method: 'POST', body: form })
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(err.detail || 'Ingest failed')
   }
-  return res.json()
+  const { task_id } = await res.json()
+
+  // Poll until done
+  while (true) {
+    await new Promise(r => setTimeout(r, 800))
+    const statusRes = await fetch(`${BASE}/ingest/status/${task_id}`)
+    const task = await statusRes.json()
+    if (task.status === 'done') return task.result
+    if (task.status === 'error') throw new Error(task.message)
+  }
 }
 
 // ── Wipe ──────────────────────────────────────────────────

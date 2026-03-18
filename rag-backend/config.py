@@ -1,65 +1,82 @@
-import os
+from pydantic_settings import BaseSettings
 from pathlib import Path
-from dotenv import load_dotenv
 
-load_dotenv()
+BASE_DIR = Path(__file__).parent
 
-# ── API Keys ──────────────────────────────────────────────
-GROQ_API_KEY     = os.getenv("GROQ_API_KEY")
-HF_TOKEN         = os.getenv("HF_TOKEN")
 
-# ── LLM ───────────────────────────────────────────────────
-GROQ_MODEL       = "llama-3.3-70b-versatile"
-OLLAMA_MODEL     = "llama3.2"
-OLLAMA_EMBED_MODEL = "nomic-embed-text"
+class Settings(BaseSettings):
+    # LLM
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.3-70b-versatile"
+    ollama_model: str = "llama3.2"
+    max_turns: int = 20
 
-# ── Embedding ─────────────────────────────────────────────
-# BGE-small-en-v1.5: same 22MB / 384-dim as MiniLM, ~10% better MTEB retrieval
-# BGE uses asymmetric prompting: different prefix for queries vs documents
-EMBEDDING_MODEL  = "BAAI/bge-small-en-v1.5"
-EMBEDDING_DIM    = 384
+    # Qdrant
+    qdrant_path: str = str(BASE_DIR / "data" / "qdrant")
+    qdrant_collection: str = "rag_docs"
 
-# ── Qdrant ────────────────────────────────────────────────
-QDRANT_PATH       = "./qdrant_local_db"
-QDRANT_COLLECTION = "rag_docs"
+    # Embeddings
+    embedding_model: str = "BAAI/bge-base-en-v1.5"
+    embedding_dim: int = 768
+    hf_token: str = ""
 
-# ── Pinecone (kept for compatibility, not recommended) ────
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX   = "rag-chatbot"
-PINECONE_CLOUD   = "aws"
-PINECONE_REGION  = "us-east-1"
+    # Chunking
+    chunk_size: int = 500
+    chunk_overlap: int = 50
+    child_chunk_size: int = 300
+    child_chunk_overlap: int = 30
+    parent_chunk_size: int = 1200
+    parent_chunk_overlap: int = 100
 
-# ── Hierarchical Chunking ─────────────────────────────────
-# child  → embedded into Qdrant  (precise retrieval)
-# parent → stored on disk        (rich context for LLM)
-CHILD_CHUNK_SIZE    = 300
-CHILD_CHUNK_OVERLAP = 50
-PARENT_CHUNK_SIZE   = 1200
-PARENT_CHUNK_OVERLAP= 100
+    # Retrieval
+    top_k: int = 20
+    rrf_k: int = 60
+    min_rerank_score: float = 0.1
 
-# Legacy flat chunking (kept for FixedSizeChunker / RecursiveChunker)
-CHUNK_SIZE    = 500
-CHUNK_OVERLAP = 100
+    # Sessions
+    session_max: int = 100
+    session_ttl: int = 3600
 
-# ── Retrieval ─────────────────────────────────────────────
-TOP_K        = 20   # fetch candidates
-RERANK_TOP_K = 5    # keep after rerank
-RRF_K        = 60   # RRF constant (paper default)
+    # Pinecone (optional, not wired by default)
+    pinecone_api_key: str = ""
+    pinecone_index: str = "rag-index"
+    pinecone_cloud: str = "aws"
+    pinecone_region: str = "us-east-1"
 
-# ── BM25 persistence ──────────────────────────────────────
-BM25_PATH          = "./bm25_index.pkl"
-PARENT_STORE_PATH  = "./parent_store.pkl"
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
 
-# ── Memory ────────────────────────────────────────────────
-MAX_TURNS = 8   # sliding window — 8 turns = 16 messages
 
-# ── Retrieval quality gate ────────────────────────────────
-# Cross-encoder rerank score below this → "not in documents" fallback
-MIN_RERANK_SCORE = -5.0
+settings = Settings()
 
-# ── PDF ───────────────────────────────────────────────────
-IMAGES_DIR            = "./extracted_images"
-# No Tesseract — removed entirely. Page context used for image semantics.
+# ── Legacy constants ───────────────────────────────────────────
+QDRANT_PATH          = settings.qdrant_path
+QDRANT_COLLECTION    = settings.qdrant_collection
+EMBEDDING_DIM        = settings.embedding_dim
+TOP_K                = settings.top_k
+RRF_K                = settings.rrf_k
+MIN_RERANK_SCORE     = settings.min_rerank_score
+CHUNK_SIZE           = settings.chunk_size
+CHUNK_OVERLAP        = settings.chunk_overlap
+CHILD_CHUNK_SIZE     = settings.child_chunk_size
+CHILD_CHUNK_OVERLAP  = settings.child_chunk_overlap
+PARENT_CHUNK_SIZE    = settings.parent_chunk_size
+PARENT_CHUNK_OVERLAP = settings.parent_chunk_overlap
+GROQ_MODEL           = settings.groq_model
+GROQ_API_KEY         = settings.groq_api_key        # ← ADD
+MAX_TURNS            = settings.max_turns            # ← ADD
+OLLAMA_MODEL         = settings.ollama_model
+PINECONE_API_KEY     = settings.pinecone_api_key
+PINECONE_INDEX       = settings.pinecone_index
+PINECONE_CLOUD       = settings.pinecone_cloud
+PINECONE_REGION      = settings.pinecone_region
+EMBEDDING_MODEL      = settings.embedding_model
+OLLAMA_EMBED_MODEL   = settings.ollama_model
+HF_TOKEN             = settings.hf_token
+BM25_PATH            = str(Path(settings.qdrant_path).parent / "bm25.pkl")
+IMAGES_DIR           = str(BASE_DIR / "data" / "images")
 
-# ── Dev ───────────────────────────────────────────────────
-RESET_ON_START = False
+# Ensure directories exist
+Path(IMAGES_DIR).mkdir(parents=True, exist_ok=True)
+Path(settings.qdrant_path).mkdir(parents=True, exist_ok=True)

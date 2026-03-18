@@ -1,23 +1,13 @@
 # retrieval/naive_retriever.py
-#
-# CHANGES vs original:
-#   - RetrievalResult.to_context_string() now includes section_path
-#     in the header so the LLM knows exactly which section each chunk came from
-#   - RetrievalResult.get_citations() now includes heading + section_path
-#     so ChainResponse can show richer source attribution in the UI
-#   - NaiveRetriever gains optional parent_store parameter
-#     When provided, retrieved child chunks are expanded to their parent
-#     (same small-to-big pattern as HybridRetriever)
-#   - NaiveRetriever.retrieve() now embeds query itself via embedder.embed_text()
-#     (previously used store.search(query_string) which re-embedded internally)
-#   - All class names and method signatures unchanged
 
 import os
 import sys
+import pathlib
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from vectorstore.qdrant_store import QdrantVectorStore, BaseVectorStore
 from embeddings.embedder      import BaseEmbedder, EmbedderFactory
+from utils.parent_store       import ParentStore
 from config import TOP_K
 
 
@@ -30,22 +20,17 @@ class RetrievalResult:
     Wraps the output of a retrieval call.
     Provides raw chunks, formatted context, and citations
     all from one object.
-
-    CHANGES vs original:
-      - to_context_string() includes section_path in header
-      - get_citations() returns heading + section_path
-      - max_chars bumped 4000 → 6000 (denser PDFs need more context)
     """
 
     def __init__(self, chunks: list[dict]):
-        self.chunks = chunks   # list of {content, score, source, page, type, ...}
+        self.chunks = chunks
 
     # ── FORMATTED CONTEXT ─────────────────────────────────
 
     def to_context_string(self, max_chars: int = 6000) -> str:
         """
         Format chunks into a single LLM-ready context block.
-        Header now includes section_path for richer attribution.
+        Includes section_path in header for richer attribution.
 
         Example output:
             [Source: report.pdf | Page: 2 | Section: Chapter 3 > Results]
@@ -81,8 +66,8 @@ class RetrievalResult:
 
     def get_citations(self) -> list[dict]:
         """
-        Return deduplicated citations with source, page, heading, section_path.
-        IMPROVED: includes section_path for richer UI display.
+        Return deduplicated citations with source, page,
+        heading, and section_path.
         """
         seen:    set        = set()
         results: list[dict] = []
@@ -108,9 +93,11 @@ class RetrievalResult:
             return ""
         lines = []
         for i, c in enumerate(cites, 1):
-            page_str    = f", p.{c['page']}"     if c["page"] is not None else ""
-            section_str = f" [{c['section_path']}]" if c.get("section_path") else (
-                          f" [{c['heading']}]"      if c.get("heading")      else "")
+            page_str    = f", p.{c['page']}" if c["page"] is not None else ""
+            section_str = (
+                f" [{c['section_path']}]" if c.get("section_path") else
+                f" [{c['heading']}]"      if c.get("heading")      else ""
+            )
             lines.append(f"  [{i}] {c['source']}{page_str}{section_str}")
         return "Sources:\n" + "\n".join(lines)
 
@@ -123,13 +110,15 @@ class RetrievalResult:
         return self.chunks[0] if self.chunks else None
 
     def get_images(self) -> list[str]:
-        """Return absolute paths of retrieved image chunks that exist on disk.
-        Also tries resolving relative to the project root if the stored path
-        doesn't exist at face value (handles CWD differences).
         """
-        import pathlib
+        Return absolute paths of retrieved image chunks that exist on disk.
+        Falls back to searching under data/images/ if the stored path
+        doesn't resolve directly.
+        """
         project_root = pathlib.Path(__file__).parent.parent
-        results = []
+        images_dir   = project_root / "data" / "images"
+        results      = []
+
         for c in self.chunks:
             if c.get("type") != "image" or not c.get("image_path"):
                 continue
@@ -137,10 +126,11 @@ class RetrievalResult:
             if os.path.exists(p):
                 results.append(p)
                 continue
-            # Try resolving basename against project_root/extracted_images
-            alt = str(project_root / "extracted_images" / os.path.basename(p))
+            # Fallback: look in canonical images directory
+            alt = str(images_dir / os.path.basename(p))
             if os.path.exists(alt):
                 results.append(alt)
+
         return results
 
     def best_score(self) -> float:
@@ -161,13 +151,14 @@ class NaiveRetriever:
     """
     Dense-only vector retriever with optional parent expansion.
 
-    CHANGES vs original:
-      - parent_store parameter added (optional)
-        When provided, child chunks are expanded to their parent
-        before being returned — same small-to-big pattern as HybridRetriever
-      - retrieve() embeds query via embedder.embed_text() directly
-        (avoids double-embedding that happened when passing string to store.search())
-      - get_info() unchanged
+    Embeds the query once via the embedder and passes the vector
+    directly to the store — avoids the double-embedding that
+    occurred when passing a string to store.search().
+
+    When parent_store is provided (a ParentStore instance),
+    retrieved child chunks are swapped for their parent
+    (1200-char) versions before being returned — same
+    small-to-big pattern as HybridRetriever.
     """
 
     def __init__(
@@ -175,14 +166,16 @@ class NaiveRetriever:
         vector_store : BaseVectorStore = None,
         embedder     : BaseEmbedder    = None,
         top_k        : int             = TOP_K,
-        parent_store : dict            = None,  # {parent_id: parent_dict}
+        parent_store : ParentStore     = None,
     ):
         self.embedder     = embedder or EmbedderFactory.get("huggingface")
         self.store        = vector_store or QdrantVectorStore(embedder=self.embedder)
         self.top_k        = top_k
-        self.parent_store = parent_store or {}
+        self.parent_store = parent_store   # ParentStore instance or None
 
         print(f"  [NAIVE] NaiveRetriever ready. top_k={top_k}")
+        if parent_store:
+            print(f"  [NAIVE] Parent store attached ({len(parent_store)} entries)")
 
     def retrieve(self, query: str, top_k: int = None) -> RetrievalResult:
         """
@@ -193,11 +186,11 @@ class NaiveRetriever:
             top_k : override instance default
 
         Returns:
-            RetrievalResult — same as before, but with parent-expanded content
+            RetrievalResult with parent-expanded chunks if store provided
         """
-        k        = top_k or self.top_k
-        q_vec    = self.embedder.embed_text(query)
-        results  = self.store.search(query_vector=q_vec, top_k=k)
+        k       = top_k or self.top_k
+        q_vec   = self.embedder.embed_text(query)
+        results = self.store.search(query_vector=q_vec, top_k=k)
 
         if self.parent_store:
             results = self._expand_to_parents(results)
@@ -208,28 +201,42 @@ class NaiveRetriever:
 
     def _expand_to_parents(self, chunks: list[dict]) -> list[dict]:
         """
-        Swap child chunks for their parent chunks.
+        Swap child chunks for their parent chunks using a single
+        batch fetch from ParentStore — one DB query for all IDs
+        instead of N individual lookups.
+
         Falls back to child if parent not found.
-        Deduplicates on parent_id.
+        Deduplicates on parent_id so the same parent is never
+        sent to the LLM twice.
         """
-        expanded:     list[dict] = []
-        seen_parents: set        = set()
+        # Collect all parent IDs that need fetching
+        parent_ids = [
+            c.get("parent_id", "") for c in chunks
+            if c.get("parent_id")
+        ]
+
+        # Batch fetch — single SQLite query
+        parent_map   = self.parent_store.get_batch(parent_ids) if parent_ids else {}
+        expanded     : list[dict] = []
+        seen_parents : set        = set()
 
         for child in chunks:
             parent_id = child.get("parent_id", "")
 
-            if parent_id and parent_id in self.parent_store:
+            if parent_id and parent_id in parent_map:
                 if parent_id in seen_parents:
                     continue
                 seen_parents.add(parent_id)
 
-                parent = self.parent_store[parent_id]
+                parent = parent_map[parent_id]
                 merged = {
+                    # Parent content — larger, more context for LLM
                     "content"     : parent["content"],
+                    # Child metadata — for citations and scoring
                     "score"       : child.get("score", 0.0),
-                    "source"      : child.get("source", parent.get("source", "")),
-                    "page"        : child.get("page",   parent.get("page")),
-                    "type"        : child.get("type",   parent.get("type", "text")),
+                    "source"      : child.get("source",       parent.get("source", "")),
+                    "page"        : child.get("page",         parent.get("page")),
+                    "type"        : child.get("type",         parent.get("type", "text")),
                     "heading"     : child.get("heading",      parent.get("heading", "")),
                     "section_path": child.get("section_path", parent.get("section_path", "")),
                     "parent_id"   : parent_id,
@@ -237,6 +244,7 @@ class NaiveRetriever:
                 }
                 expanded.append(merged)
             else:
+                # No parent found — use child as-is (graceful fallback)
                 expanded.append(child)
 
         return expanded
@@ -244,14 +252,13 @@ class NaiveRetriever:
     # ── CONVENIENCE ───────────────────────────────────────
 
     def get_context(self, query: str, **kwargs) -> str:
-        """One-liner: retrieve and return formatted context string."""
         return self.retrieve(query, **kwargs).to_context_string()
 
     def get_info(self) -> dict:
         return {
             "type"        : "NaiveRetriever",
             "top_k"       : self.top_k,
-            "parent_store": len(self.parent_store),
+            "parent_store": len(self.parent_store) if self.parent_store else 0,
             "vector_store": self.store.get_stats(),
         }
 

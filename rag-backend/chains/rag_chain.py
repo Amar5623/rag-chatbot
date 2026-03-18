@@ -1,18 +1,4 @@
 # chains/rag_chain.py
-#
-# CHANGES vs original:
-#   - QueryRouter class added — rule-based, zero latency classifier
-#     Chitchat → instant canned response, no retrieval
-#     Document query → full pipeline
-#     This prevents greetings from burning retrieval + LLM time
-#   - RAGChain.ask() and stream() check router first
-#   - Fallback chain added:
-#     If reranker's best score < MIN_RERANK_SCORE → "not found in documents"
-#     instead of hallucinating an answer from empty context
-#   - parent_store wiring: RAGChain constructor accepts parent_store dict
-#     and passes it to the retriever
-#   - ChainResponse unchanged — same get_citations(), get_images(), usage
-#   - get_info() now exposes query_type from last call
 
 import os
 import re
@@ -29,22 +15,19 @@ from config                     import TOP_K, MIN_RERANK_SCORE
 
 
 # ─────────────────────────────────────────────────────────
-# PROMPT TEMPLATES  (unchanged)
+# PROMPT TEMPLATES
 # ─────────────────────────────────────────────────────────
 
 RAG_SYSTEM_PROMPT = """\
-You are a precise document assistant. You answer questions based on the provided context documents AND the ongoing conversation history.
+You are a precise document assistant. Answer questions based on the provided context documents AND the ongoing conversation history.
 
 Rules:
-1. For factual claims about documents, answer from the provided context. Do not invent facts not in the context.
-2. For follow-up questions that reference previous turns (e.g. "what about that?", "you mentioned X earlier", \
-"my name is Y" from earlier in conversation), use the conversation history — this is expected and correct.
-3. If neither the context nor the conversation history contains sufficient information, say:
-   "I don't have enough information in the provided documents to answer this."
-4. Be concise and direct. No padding, no "certainly!" or "great question!"
-5. Do NOT write a 'Sources:' or 'References:' section at the end of your answer. Source citations are handled separately by the system. Do not list filenames or page numbers at the bottom.
-6. Preserve technical terminology exactly as it appears in the source.
-7. Always format tabular data as a markdown table using | col | col | syntax."""
+1. For factual claims, answer strictly from the provided context. Do not invent facts not in the context.
+2. For follow-up questions referencing previous turns, use the conversation history — this is expected and correct.
+3. Be concise and direct. No padding, no "certainly!" or "great question!"
+4. Do NOT write a 'Sources:' or 'References:' section — citations are handled separately by the system.
+5. Preserve technical terminology exactly as it appears in the source.
+6. Always format tabular data as a markdown table using | col | col | syntax."""
 
 RAG_USER_TEMPLATE = """\
 Context:
@@ -52,11 +35,20 @@ Context:
 
 Question: {question}"""
 
+GENERAL_FALLBACK_PROMPT = """\
+You are a helpful assistant. The user asked a question but the provided documents do not contain relevant information to answer it.
 
-NOT_FOUND_RESPONSE = (
-    "I don't have enough information in the provided documents to answer this. "
-    "Please make sure the relevant document is uploaded and indexed."
-)
+Rules:
+1. Start your response with one short sentence noting the documents didn't cover this topic.
+2. Then answer from your general knowledge if you have sufficient knowledge on the topic.
+3. If you don't have general knowledge on it either, say so honestly.
+4. Be concise. No padding."""
+
+CHITCHAT_SYSTEM_PROMPT = """\
+You are a helpful document assistant. You help users understand their uploaded documents.
+For casual conversation, respond naturally and briefly.
+If the user shares personal info like their name, acknowledge it warmly and remember it for the conversation.
+You can briefly mention you can answer questions about their uploaded documents, but don't be repetitive about it."""
 
 NO_KB_RESPONSE = (
     "No documents are loaded yet. "
@@ -65,102 +57,70 @@ NO_KB_RESPONSE = (
 
 
 # ─────────────────────────────────────────────────────────
-# QUERY ROUTER  (NEW)
+# QUERY ROUTER
 # ─────────────────────────────────────────────────────────
 
 class QueryRouter:
     """
     Rule-based query classifier — zero latency, no LLM call.
 
-    Two classes:
-        CHITCHAT  → greetings, thanks, goodbyes, small talk
-        DOCUMENT  → everything else (safe default)
+    Three classes:
+        CHITCHAT → greetings, thanks, goodbyes, name sharing, small talk
+        DOCUMENT → everything else (safe default)
+        GENERAL  → used internally when doc retrieval fails
+
+    All classes route through the LLM — no canned string responses.
+    The class only decides WHICH system prompt and pipeline to use.
 
     Design choice: errs on the side of DOCUMENT when uncertain.
-    Better to retrieve and say "not found" than to skip a real question.
+    Better to attempt retrieval and fall back gracefully than to
+    skip a real document question.
     """
 
     CHITCHAT = "chitchat"
     DOCUMENT = "document"
+    GENERAL  = "general"
 
-    # fmt: off
     _PATTERNS = [
         r"^\s*(hi+|hello+|hey+|howdy|greetings)\s*[!.?]*\s*$",
         r"^\s*good\s*(morning|afternoon|evening|day|night)\s*[!.?]*\s*$",
         r"^\s*how are you\b.*$",
         r"^\s*(thanks?|thank\s*you|thx|ty|cheers)\s*[!.?]*\s*$",
         r"^\s*(bye|goodbye|see\s*ya?|cya|later|take\s*care)\s*[!.?]*\s*$",
-        r"^\s*(ok+|okay|sure|got\s*it|understood|alright|cool|nice|great|awesome)\s*[!.?]*\s*$",
-        r"^\s*(yes|yeah|yep|yup|no|nope|nah)\s*[!.?]*\s*$",
         r"^\s*who\s+are\s+you\s*[?!.]*\s*$",
         r"^\s*what\s+(can|do)\s+you\s+(do|help(\s+with)?)\s*[?!.]*\s*$",
         r"^\s*help\s*[?!.]*\s*$",
         r"^\s*(what('?s| is) (up|new))\s*[?!.]*\s*$",
         r"^\s*tell me (a )?joke\s*[?!.]*\s*$",
+        r"^\s*my name is\b.*$",
+        r"^\s*i('?m| am)\s+\w+\s*[!.?]*\s*$",
+        r"^\s*call me\s+\w+\s*[!.?]*\s*$",
         r"^\s*nice\s*(work|job|one)\s*[!.?]*\s*$",
     ]
-    # fmt: on
 
     _COMPILED = [re.compile(p, re.IGNORECASE) for p in _PATTERNS]
-
-    _RESPONSES = {
-        "greeting": (
-            "Hey! I'm your document assistant. "
-            "Upload some PDFs and ask me anything about them."
-        ),
-        "thanks"  : "You're welcome! Anything else about your documents?",
-        "bye"     : "Goodbye! Come back anytime.",
-        "help"    : (
-            "I can answer questions about your uploaded documents. "
-            "Just ask me anything — I'll search through the content and give you a precise answer with sources."
-        ),
-        "who"     : (
-            "I'm a RAG assistant — I read your documents and answer questions "
-            "based strictly on their content."
-        ),
-        "default" : "Got it! Feel free to ask me anything about your documents.",
-    }
 
     @classmethod
     def classify(cls, question: str) -> str:
         q = question.strip()
-
         for pattern in cls._COMPILED:
             if pattern.match(q):
                 return cls.CHITCHAT
-
-        # Very short + no question mark → likely chitchat
-        words = q.split()
-        if len(words) <= 2 and "?" not in q:
+        # Very short with no question mark → likely chitchat
+        if len(q.split()) <= 2 and "?" not in q:
             return cls.CHITCHAT
-
         return cls.DOCUMENT
-
-    @classmethod
-    def get_chitchat_response(cls, question: str) -> str:
-        q = question.lower()
-        if any(w in q for w in ("hi", "hello", "hey", "howdy", "morning", "afternoon", "evening")):
-            return cls._RESPONSES["greeting"]
-        if any(w in q for w in ("thanks", "thank", "thx", "ty")):
-            return cls._RESPONSES["thanks"]
-        if any(w in q for w in ("bye", "goodbye", "cya", "later")):
-            return cls._RESPONSES["bye"]
-        if "help" in q:
-            return cls._RESPONSES["help"]
-        if "who are you" in q or "what can you do" in q:
-            return cls._RESPONSES["who"]
-        return cls._RESPONSES["default"]
 
 
 # ─────────────────────────────────────────────────────────
-# CHAIN RESPONSE  (unchanged interface)
+# CHAIN RESPONSE
 # ─────────────────────────────────────────────────────────
 
 class ChainResponse:
     """
     Wraps the full output of a RAG chain call.
-
-    Unchanged vs original — same get_citations(), get_images(), usage.
+    query_type is one of: "document", "chitchat", "general"
+    Citations and images are only meaningful when query_type == "document".
     """
 
     def __init__(
@@ -183,7 +143,7 @@ class ChainResponse:
         return self.answer
 
     def get_citations(self) -> list[dict]:
-        """Returns citation dicts with source, page, heading, section_path, type."""
+        """Returns citation dicts. Only populated when query_type == 'document'."""
         citations: list[dict] = []
         for chunk in self.retrieval.get_chunks():
             citations.append({
@@ -196,7 +156,7 @@ class ChainResponse:
         return citations
 
     def get_images(self) -> list[str]:
-        """Return absolute paths of any retrieved images that exist on disk."""
+        """Return absolute paths of retrieved images. Only populated for document answers."""
         return self.retrieval.get_images()
 
     def has_images(self) -> bool:
@@ -227,6 +187,7 @@ class ChainResponse:
         return (
             f"ChainResponse("
             f"model={self.model}, "
+            f"query_type={self.query_type}, "
             f"chunks={len(self.retrieval)}, "
             f"images={len(self.get_images())}, "
             f"tokens={self.usage.get('total_tokens', '?')})"
@@ -241,13 +202,12 @@ class RAGChain:
     """
     Full RAG pipeline: Route → Retrieve → Rerank → Generate.
 
-    CHANGES vs original:
-      - QueryRouter: chitchat is handled instantly without retrieval
-      - parent_store: passed to retriever for small-to-big expansion
-      - Fallback: if reranker best score < MIN_RERANK_SCORE → not-found response
-        prevents hallucination when context is empty or irrelevant
-      - has_kb parameter on ask()/stream() for clean "no documents" path
-      - ChainResponse gains query_type field
+    Query priority:
+      1. Chitchat  → LLM with chitchat system prompt (no retrieval)
+      2. No KB     → LLM with general knowledge prompt
+      3. Document  → retrieve from KB
+                     if context weak → LLM with general knowledge fallback
+                     if context good → full RAG answer with citations
     """
 
     def __init__(
@@ -261,7 +221,6 @@ class RAGChain:
         rerank_top_k  : int             = 5,
         cite_sources  : bool            = True,
         llm_provider  : str             = "groq",
-        parent_store  : dict            = None,   # {parent_id: parent_dict}
     ):
         # ── LLM ───────────────────────────────────────────
         self.llm = llm or LLMFactory.get(llm_provider)
@@ -271,21 +230,14 @@ class RAGChain:
         embedder   = EmbedderFactory.get("huggingface")
         self.store = vector_store or QdrantVectorStore(embedder=embedder)
 
-        # ── Parent store ──────────────────────────────────
-        self.parent_store = parent_store or {}
-
         # ── Retriever ─────────────────────────────────────
         if retriever is not None:
             self.retriever = retriever
-            # Inject parent_store into existing retriever if it supports it
-            if hasattr(self.retriever, "parent_store") and self.parent_store:
-                self.retriever.parent_store = self.parent_store
         else:
             self.retriever = HybridRetriever(
                 vector_store = self.store,
                 embedder     = embedder,
                 top_k        = retrieve_top_k,
-                parent_store = self.parent_store,
             )
 
         # ── Reranker ──────────────────────────────────────
@@ -298,14 +250,14 @@ class RAGChain:
         self.cite_sources   = cite_sources
 
         # ── Memory ────────────────────────────────────────
-        self.history   = self.llm.history
-        self._last_type= QueryRouter.DOCUMENT
+        self.history    = self.llm.history
+        self._last_type = QueryRouter.DOCUMENT
 
         print(f"\n  [RAG CHAIN] ✅ Ready!")
         print(f"  [RAG CHAIN] LLM       : {self.llm.model_name}")
         print(f"  [RAG CHAIN] Retriever : {type(self.retriever).__name__}")
         print(f"  [RAG CHAIN] Reranker  : {'✅' if use_reranker else '❌'}")
-        print(f"  [RAG CHAIN] Router    : ✅ (chitchat bypass active)")
+        print(f"  [RAG CHAIN] Router    : ✅ (LLM-routed, no canned responses)")
         print(f"  [RAG CHAIN] Citations : {'✅' if cite_sources else '❌'}")
 
     # ── INDEXING ──────────────────────────────────────────
@@ -333,23 +285,14 @@ class RAGChain:
     def _build_prompt(self, question: str, context: str) -> str:
         return RAG_USER_TEMPLATE.format(context=context, question=question)
 
-    # ── HYDE QUERY EXPANSION ──────────────────────────────
+    # ── QUERY EXPANSION ───────────────────────────────────
 
     def _expand_query(self, question: str) -> str:
         """
-        HyDE (Hypothetical Document Embedding) query expansion.
-
-        Always-on. Uses conversation history as context so vague follow-ups
-        like "wat about last yr?" or "what did it say about rev?" are
-        rewritten into clean, self-contained search queries.
-
-        The expanded query is used ONLY for retrieval — the original
-        question is still passed to the LLM for generation so the
-        answer stays natural.
-
-        Returns the expanded query string (or original if expansion fails).
+        Query rewriting using conversation context.
+        Rewrites vague follow-ups into clean standalone search queries.
+        Used ONLY for retrieval — original question goes to the LLM.
         """
-        # Build a compact conversation context (last 3 user turns only)
         recent_turns = [
             m["content"] for m in self.history._turns
             if m["role"] == "user"
@@ -381,158 +324,235 @@ class RAGChain:
             )
             expanded = resp.choices[0].message.content.strip().strip('"').strip("'")
             if expanded:
-                print(f"  [HYDE] '{question[:40]}' → '{expanded[:60]}'")
+                print(f"  [QUERY EXPAND] '{question[:40]}' → '{expanded[:60]}'")
                 return expanded
         except Exception as e:
-            print(f"  [HYDE] Expansion failed: {e}")
+            print(f"  [QUERY EXPAND] Failed: {e}")
 
         return question
 
+    # ── HELPER: stream through LLM with a given system prompt ─
+
+    def _stream_with_prompt(self, system_prompt: str, user_prompt: str):
+        """
+        Internal helper. Sets system prompt, streams LLM response,
+        restores RAG system prompt, returns (full_reply, usage).
+        Yields str tokens during streaming.
+        """
+        self.llm.set_system_prompt(system_prompt)
+        full_reply: list[str] = []
+        usage: dict = {}
+        for chunk in self.llm.stream(
+            prompt   = user_prompt,
+            history  = self.history,
+            store_as = user_prompt,
+        ):
+            if isinstance(chunk, str):
+                full_reply.append(chunk)
+                yield chunk
+            else:
+                usage = chunk.get("usage", {})
+        self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
+        yield {"_meta": True, "full_reply": "".join(full_reply), "usage": usage}
+
     # ── ASK (blocking) ────────────────────────────────────
 
-    def ask(
-        self,
-        question  : str,
-        top_k     : int  = None,
-        has_kb    : bool = True,
-    ) -> ChainResponse:
+    def ask(self, question: str, top_k: int = None, has_kb: bool = True) -> ChainResponse:
         """
-        Blocking RAG pipeline with router + fallback.
-
-        Args:
-            question : user's question
-            has_kb   : set False if no documents are indexed yet
+        Blocking RAG pipeline.
+        Priority: chitchat → no_kb → doc retrieval → general fallback
         """
-        # ── 1. Router ──────────────────────────────────────
         query_type = QueryRouter.classify(question)
         self._last_type = query_type
 
+        # ── 1. Chitchat ───────────────────────────────────
         if query_type == QueryRouter.CHITCHAT:
-            response = QueryRouter.get_chitchat_response(question)
+            self.llm.set_system_prompt(CHITCHAT_SYSTEM_PROMPT)
+            result = self.llm.generate(
+                prompt   = question,
+                history  = self.history,
+                store_as = question,
+            )
+            self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
             return ChainResponse(
-                answer    = response,
-                retrieval = RetrievalResult([]),
-                question  = question,
-                model     = self.llm.model_name,
-                query_type= QueryRouter.CHITCHAT,
+                answer     = result["content"],
+                retrieval  = RetrievalResult([]),
+                question   = question,
+                model      = result["model"],
+                usage      = result["usage"],
+                query_type = QueryRouter.CHITCHAT,
             )
 
-        # ── 2. No KB guard ─────────────────────────────────
+        # ── 2. No KB ──────────────────────────────────────
         if not has_kb:
+            self.llm.set_system_prompt(GENERAL_FALLBACK_PROMPT)
+            result = self.llm.generate(
+                prompt   = question,
+                history  = self.history,
+                store_as = question,
+            )
+            self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
             return ChainResponse(
-                answer    = NO_KB_RESPONSE,
-                retrieval = RetrievalResult([]),
-                question  = question,
-                model     = self.llm.model_name,
-                query_type= QueryRouter.DOCUMENT,
+                answer     = result["content"],
+                retrieval  = RetrievalResult([]),
+                question   = question,
+                model      = result["model"],
+                usage      = result["usage"],
+                query_type = QueryRouter.GENERAL,
             )
 
-        # ── 3. Expand query + retrieve + rerank ────────────
+        # ── 3. Retrieve ───────────────────────────────────
         expanded  = self._expand_query(question)
         retrieval = self._retrieve(expanded)
         context   = retrieval.to_context_string()
 
-        # ── 4. Fallback if context is empty or low quality ─
+        # ── 4. Weak context → general knowledge fallback ──
         if not context.strip() or (
             self.use_reranker
             and retrieval.best_score() < MIN_RERANK_SCORE
         ):
-            self.history.add_user(question)
-            self.history.add_assistant(NOT_FOUND_RESPONSE)
+            self.llm.set_system_prompt(GENERAL_FALLBACK_PROMPT)
+            result = self.llm.generate(
+                prompt   = question,
+                history  = self.history,
+                store_as = question,
+            )
+            self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
             return ChainResponse(
-                answer    = NOT_FOUND_RESPONSE,
-                retrieval = retrieval,
-                question  = question,
-                model     = self.llm.model_name,
-                query_type= QueryRouter.DOCUMENT,
+                answer     = result["content"],
+                retrieval  = RetrievalResult([]),   # no citations on fallback
+                question   = question,
+                model      = result["model"],
+                usage      = result["usage"],
+                query_type = QueryRouter.GENERAL,
             )
 
-        # ── 5. Generate ────────────────────────────────────
+        # ── 5. Full RAG ───────────────────────────────────
+        self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
         prompt = self._build_prompt(question, context)
         result = self.llm.generate(
-            prompt    = prompt,
-            history   = self.history,
-            store_as  = question,   # store clean question, not full prompt+context
+            prompt   = prompt,
+            history  = self.history,
+            store_as = question,
         )
-
         return ChainResponse(
-            answer    = result["content"],
-            retrieval = retrieval,
-            question  = question,
-            model     = result["model"],
-            usage     = result["usage"],
-            query_type= QueryRouter.DOCUMENT,
+            answer     = result["content"],
+            retrieval  = retrieval,
+            question   = question,
+            model      = result["model"],
+            usage      = result["usage"],
+            query_type = QueryRouter.DOCUMENT,
         )
 
     # ── STREAM (generator) ────────────────────────────────
 
     def stream(self, question: str, has_kb: bool = True):
         """
-        Streaming RAG pipeline with router + fallback.
+        Streaming RAG pipeline.
+        Priority: chitchat → no_kb → doc retrieval → general fallback
 
         Yields:
             str           — text tokens as they stream
             ChainResponse — final item with full metadata
         """
-        # ── 1. Router ──────────────────────────────────────
         query_type = QueryRouter.classify(question)
         self._last_type = query_type
 
+        # ── 1. Chitchat ───────────────────────────────────
         if query_type == QueryRouter.CHITCHAT:
-            response = QueryRouter.get_chitchat_response(question)
-            yield response
+            self.llm.set_system_prompt(CHITCHAT_SYSTEM_PROMPT)
+            full_reply: list[str] = []
+            usage: dict = {}
+            for chunk in self.llm.stream(
+                prompt   = question,
+                history  = self.history,
+                store_as = question,
+            ):
+                if isinstance(chunk, str):
+                    full_reply.append(chunk)
+                    yield chunk
+                else:
+                    usage = chunk.get("usage", {})
+            self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
             yield ChainResponse(
-                answer    = response,
-                retrieval = RetrievalResult([]),
-                question  = question,
-                model     = self.llm.model_name,
-                query_type= QueryRouter.CHITCHAT,
+                answer     = "".join(full_reply),
+                retrieval  = RetrievalResult([]),
+                question   = question,
+                model      = self.llm.model_name,
+                usage      = usage,
+                query_type = QueryRouter.CHITCHAT,
             )
             return
 
-        # ── 2. No KB guard ─────────────────────────────────
+        # ── 2. No KB ──────────────────────────────────────
         if not has_kb:
-            yield NO_KB_RESPONSE
+            self.llm.set_system_prompt(GENERAL_FALLBACK_PROMPT)
+            full_reply = []
+            usage = {}
+            for chunk in self.llm.stream(
+                prompt   = question,
+                history  = self.history,
+                store_as = question,
+            ):
+                if isinstance(chunk, str):
+                    full_reply.append(chunk)
+                    yield chunk
+                else:
+                    usage = chunk.get("usage", {})
+            self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
             yield ChainResponse(
-                answer    = NO_KB_RESPONSE,
-                retrieval = RetrievalResult([]),
-                question  = question,
-                model     = self.llm.model_name,
-                query_type= QueryRouter.DOCUMENT,
+                answer     = "".join(full_reply),
+                retrieval  = RetrievalResult([]),
+                question   = question,
+                model      = self.llm.model_name,
+                usage      = usage,
+                query_type = QueryRouter.GENERAL,
             )
             return
 
-        # ── 3. Expand query + retrieve + rerank ────────────
+        # ── 3. Retrieve ───────────────────────────────────
         expanded  = self._expand_query(question)
         retrieval = self._retrieve(expanded)
         context   = retrieval.to_context_string()
 
-        # ── 4. Fallback ────────────────────────────────────
+        # ── 4. Weak context → general knowledge fallback ──
         if not context.strip() or (
             self.use_reranker
             and retrieval.best_score() < MIN_RERANK_SCORE
         ):
-            self.history.add_user(question)
-            self.history.add_assistant(NOT_FOUND_RESPONSE)
-            yield NOT_FOUND_RESPONSE
+            self.llm.set_system_prompt(GENERAL_FALLBACK_PROMPT)
+            full_reply = []
+            usage = {}
+            for chunk in self.llm.stream(
+                prompt   = question,
+                history  = self.history,
+                store_as = question,
+            ):
+                if isinstance(chunk, str):
+                    full_reply.append(chunk)
+                    yield chunk
+                else:
+                    usage = chunk.get("usage", {})
+            self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
             yield ChainResponse(
-                answer    = NOT_FOUND_RESPONSE,
-                retrieval = retrieval,
-                question  = question,
-                model     = self.llm.model_name,
-                query_type= QueryRouter.DOCUMENT,
+                answer     = "".join(full_reply),
+                retrieval  = RetrievalResult([]),   # no citations on fallback
+                question   = question,
+                model      = self.llm.model_name,
+                usage      = usage,
+                query_type = QueryRouter.GENERAL,
             )
             return
 
-        # ── 5. Generate (streaming) ────────────────────────
+        # ── 5. Full RAG ───────────────────────────────────
+        self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
         prompt     = self._build_prompt(question, context)
-        full_reply: list[str] = []
-        usage:      dict      = {}
-
+        full_reply = []
+        usage      = {}
         for chunk in self.llm.stream(
             prompt   = prompt,
             history  = self.history,
-            store_as = question,   # store clean question, not full prompt+context
+            store_as = question,
         ):
             if isinstance(chunk, str):
                 full_reply.append(chunk)
@@ -541,12 +561,12 @@ class RAGChain:
                 usage = chunk.get("usage", {})
 
         yield ChainResponse(
-            answer    = "".join(full_reply),
-            retrieval = retrieval,
-            question  = question,
-            model     = self.llm.model_name,
-            usage     = usage,
-            query_type= QueryRouter.DOCUMENT,
+            answer     = "".join(full_reply),
+            retrieval  = retrieval,
+            question   = question,
+            model      = self.llm.model_name,
+            usage      = usage,
+            query_type = QueryRouter.DOCUMENT,
         )
 
     # ── MEMORY ────────────────────────────────────────────
@@ -563,16 +583,15 @@ class RAGChain:
 
     def get_info(self) -> dict:
         return {
-            "llm"           : self.llm.get_info(),
-            "retriever"     : type(self.retriever).__name__,
-            "reranker"      : self.reranker.get_info() if self.reranker else None,
-            "retrieve_top_k": self.retrieve_top_k,
-            "rerank_top_k"  : self.rerank_top_k,
-            "cite_sources"  : self.cite_sources,
-            "history_turns" : len(self.history),
-            "entity_facts"  : len(self.history.entity_memory),  # compat
-            "parent_store"  : len(self.parent_store),
-            "vector_store"  : self.store.get_stats(),
+            "llm"            : self.llm.get_info(),
+            "retriever"      : type(self.retriever).__name__,
+            "reranker"       : self.reranker.get_info() if self.reranker else None,
+            "retrieve_top_k" : self.retrieve_top_k,
+            "rerank_top_k"   : self.rerank_top_k,
+            "cite_sources"   : self.cite_sources,
+            "history_turns"  : len(self.history),
+            "parent_store"   : len(self.retriever.parent_store) if hasattr(self.retriever, "parent_store") and self.retriever.parent_store else 0,
+            "vector_store"   : self.store.get_stats(),
             "last_query_type": self._last_type,
         }
 
