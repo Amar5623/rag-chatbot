@@ -1,22 +1,43 @@
 # routers/chat.py
+#
+# CHANGES:
+#   - JWT protection on all endpoints
+#   - session_id derived from JWT user_id
+#   - POST /session/pin   — pin a source file for focused retrieval
+#   - DELETE /session/pin — unpin, return to full KB search
+#   - GET /session/pin    — return current pin status
 
 import json
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from schemas import ChatRequest, ClearRequest
 from services import rag_service
+from auth.dependencies import get_current_user
 
 router = APIRouter(tags=["chat"])
 
 
+# ── Pin request model ─────────────────────────────────────────
+
+class PinRequest(BaseModel):
+    filename: str
+
+
+# ── Chat stream ───────────────────────────────────────────────
+
 @router.post("/chat/stream")
-async def chat_stream(req: ChatRequest):
+async def chat_stream(
+    req         : ChatRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    session_id   = current_user["user_id"]
     vector_store = rag_service.get_vector_store()
     has_kb       = vector_store.count() > 0
-    chain        = rag_service.get_or_create_session(req.session_id)
+    chain        = rag_service.get_or_create_session(session_id)
 
     async def event_generator():
         try:
@@ -24,14 +45,9 @@ async def chat_stream(req: ChatRequest):
                 if isinstance(chunk, str):
                     yield f"data: {json.dumps({'token': chunk})}\n\n"
                 else:
-                    # Only send citations and images for full document answers.
-                    # For chitchat and general-knowledge fallback responses,
-                    # retrieval is empty so citations and images are always [].
-                    # We gate on query_type to be explicit and future-proof.
                     is_document = chunk.query_type == "document"
-
-                    citations  = []
-                    image_urls = []
+                    citations   = []
+                    image_urls  = []
 
                     if is_document:
                         citations = [
@@ -57,7 +73,60 @@ async def chat_stream(req: ChatRequest):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+# ── Session management ────────────────────────────────────────
+
 @router.post("/session/clear")
-async def clear_session(req: ClearRequest):
-    rag_service.clear_session(req.session_id)
+async def clear_session(
+    req         : ClearRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    rag_service.clear_session(current_user["user_id"])
     return {"status": "ok"}
+
+
+# ── Pin / unpin ───────────────────────────────────────────────
+
+@router.post("/session/pin")
+async def pin_source(
+    req         : PinRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Pin the session to a single source file.
+    All subsequent chat queries will only retrieve from this file.
+    """
+    session_id = current_user["user_id"]
+    chain      = rag_service.get_or_create_session(session_id)
+
+    # Verify the file actually exists in the KB
+    sources = rag_service.get_vector_store().list_sources()
+    if req.filename not in sources:
+        from fastapi import HTTPException, status
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"File '{req.filename}' not found in the knowledge base.",
+        )
+
+    chain.set_source_filter(req.filename)
+    return {"status": "ok", "pinned": req.filename}
+
+
+@router.delete("/session/pin")
+async def unpin_source(
+    current_user: dict = Depends(get_current_user),
+):
+    """Remove the source pin — return to full KB search."""
+    session_id = current_user["user_id"]
+    chain      = rag_service.get_or_create_session(session_id)
+    chain.clear_source_filter()
+    return {"status": "ok", "pinned": None}
+
+
+@router.get("/session/pin")
+async def get_pin(
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the currently pinned filename for this session, or null."""
+    session_id = current_user["user_id"]
+    chain      = rag_service.get_or_create_session(session_id)
+    return {"pinned": chain.get_source_filter()}

@@ -1,16 +1,16 @@
 # ingestion/chunker.py
 #
-# CHANGES vs original:
-#   - NEW: HierarchicalChunker — small-to-big retrieval pattern
-#       child  (300 chars) → embedded into Qdrant for precise retrieval
-#       parent (1200 chars) → stored on disk, sent to LLM for context
-#       This is the single biggest quality improvement in the pipeline.
-#   - RecursiveChunker kept and improved (adds section_path awareness)
-#   - FixedSizeChunker kept unchanged
-#   - SemanticChunkerWrapper REMOVED — uses embeddings during chunking,
-#     too slow + redundant when you already have BGE retrieval
-#   - ChunkerFactory updated: "hierarchical" is now the recommended strategy
-#   - total_chunks / chunk_index / parent_id added to every chunk dict
+# CHANGES:
+#   - HierarchicalChunker.chunk_hierarchical() now embeds parent_content
+#     directly on each child chunk dict instead of returning a separate
+#     parents dict.
+#   - This eliminates the need for ParentStore (SQLite DB) entirely.
+#   - At retrieval time HybridRetriever reads chunk["parent_content"] from
+#     the Qdrant payload — zero extra DB query.
+#   - Return signature of chunk_hierarchical() changed:
+#       OLD: (children: list[dict], parents: dict)
+#       NEW: children: list[dict]   (parents embedded inline)
+#   - All other chunkers unchanged.
 
 import os
 import sys
@@ -33,35 +33,21 @@ _ATOMIC_TYPES = {"table", "image"}
 
 
 # ─────────────────────────────────────────────────────────
-# BASE CHUNKER  (unchanged interface)
+# BASE CHUNKER
 # ─────────────────────────────────────────────────────────
 
 class BaseChunker:
-    """
-    Abstract base class for all chunking strategies.
-    Every chunker takes raw text and returns list of string chunks.
-    """
-
     def __init__(self, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP):
         self.chunk_size    = chunk_size
         self.chunk_overlap = chunk_overlap
         self.strategy_name = "base"
 
     def chunk(self, text: str) -> list[str]:
-        """Override in subclasses."""
         raise NotImplementedError("Subclasses must implement chunk()")
 
     def chunk_documents(self, docs: list[dict]) -> list[dict]:
-        """
-        Takes a list of loader chunks (dicts with 'content')
-        and re-chunks each one, preserving ALL metadata.
-
-        Tables / images are kept atomic (never re-chunked).
-        Adds chunk_index, total_chunks to every output chunk.
-        """
         result: list[dict] = []
         for doc in docs:
-            # ── Atomic content — keep as single chunk ──
             if doc.get("type") in _ATOMIC_TYPES:
                 doc["chunk_index"]  = 0
                 doc["total_chunks"] = 1
@@ -69,16 +55,15 @@ class BaseChunker:
                 result.append(doc)
                 continue
 
-            # ── Text content — split it ──
             sub_chunks = self.chunk(doc["content"])
             total      = len(sub_chunks)
 
             for i, sub in enumerate(sub_chunks):
-                new_doc                  = doc.copy()
-                new_doc["content"]       = sub
-                new_doc["chunk_index"]   = i
-                new_doc["total_chunks"]  = total
-                new_doc["strategy"]      = self.strategy_name
+                new_doc                 = doc.copy()
+                new_doc["content"]      = sub
+                new_doc["chunk_index"]  = i
+                new_doc["total_chunks"] = total
+                new_doc["strategy"]     = self.strategy_name
                 result.append(new_doc)
 
         return result
@@ -97,16 +82,10 @@ class BaseChunker:
 
 
 # ─────────────────────────────────────────────────────────
-# STRATEGY 1 — FIXED SIZE CHUNKING
+# STRATEGY 1 — FIXED SIZE
 # ─────────────────────────────────────────────────────────
 
 class FixedSizeChunker(BaseChunker):
-    """
-    Splits text into fixed character-length chunks with overlap.
-    Simplest strategy — good baseline.
-    ✅ Fast  ❌ May split mid-sentence
-    """
-
     def __init__(self, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP):
         super().__init__(chunk_size, chunk_overlap)
         self.strategy_name = "fixed_size"
@@ -122,16 +101,10 @@ class FixedSizeChunker(BaseChunker):
 
 
 # ─────────────────────────────────────────────────────────
-# STRATEGY 2 — RECURSIVE CHUNKING
+# STRATEGY 2 — RECURSIVE
 # ─────────────────────────────────────────────────────────
 
 class RecursiveChunker(BaseChunker):
-    """
-    Tries to split on paragraphs → sentences → words → characters.
-    Preserves natural language boundaries as much as possible.
-    ✅ Best for most RAG use cases  ✅ Respects sentence boundaries
-    """
-
     def __init__(self, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP):
         super().__init__(chunk_size, chunk_overlap)
         self.strategy_name = "recursive"
@@ -152,25 +125,17 @@ class RecursiveChunker(BaseChunker):
 
 class HierarchicalChunker(BaseChunker):
     """
-    Small-to-big retrieval: produces child + parent chunk pairs.
+    Small-to-big retrieval: child chunks (300 chars) embedded into Qdrant
+    for precise retrieval; parent text (1200 chars) stored directly on the
+    child as parent_content metadata field.
 
-    Pattern:
-      - Child  (300 chars) → embedded into Qdrant for precise retrieval
-      - Parent (1200 chars) → stored in parent_store dict, sent to LLM
+    CHANGE vs original:
+      chunk_hierarchical() now returns ONLY children (list[dict]).
+      Each child carries parent_content inline — no separate parents dict,
+      no SQLite parent store needed.
 
-    Why this is better than flat chunking:
-      - Small embeddings are precise (less noise per vector)
-      - LLM still gets full context (parent passage, not truncated child)
-      - 10-15% better answer quality vs flat 500-char chunks
-
-    Atomic blocks (tables, images, bullets) are never split.
-    Each atomic block becomes its own parent=child (parent_id still set).
-
-    Usage:
-        chunker = HierarchicalChunker()
-        children, parents = chunker.chunk_hierarchical(blocks)
-        # children → Qdrant
-        # parents  → pickle to disk, passed to HybridRetriever
+      At retrieval time HybridRetriever reads chunk["parent_content"]
+      directly from the Qdrant payload — zero extra DB round-trip.
     """
 
     def __init__(
@@ -198,37 +163,32 @@ class HierarchicalChunker(BaseChunker):
             separators    = ["\n\n", "\n", ". ", "! ", "? ", ", ", " ", ""],
         )
 
-    # ── chunk() — used by BaseChunker.chunk_documents() ──
-    # Returns child-sized strings (for backward compatibility)
     def chunk(self, text: str) -> list[str]:
         return [c.strip() for c in self._child_splitter.split_text(text) if c.strip()]
 
-    # ── chunk_hierarchical() — the full parent-child flow ─
-    def chunk_hierarchical(
-        self, blocks: list[dict]
-    ) -> tuple[list[dict], dict]:
+    def chunk_hierarchical(self, blocks: list[dict]) -> list[dict]:
         """
         Full hierarchical chunking pipeline.
 
         Args:
-            blocks : structured blocks from PDFLoader (or other loaders)
+            blocks : structured blocks from any loader
 
         Returns:
-            children : list[dict]  — small chunks with parent_id → Qdrant
-            parents  : dict        — {parent_id: parent_dict} → disk
+            children : list[dict]
+                Each child dict has all metadata PLUS:
+                  - parent_content : str  — the larger parent passage
+                  - parent_id      : str  — stable hash ID (kept for reference)
         """
         children: list[dict] = []
-        parents:  dict       = {}
 
-        # Separate by type
         text_blocks   = [b for b in blocks if b.get("type") not in _ATOMIC_TYPES]
         atomic_blocks = [b for b in blocks if b.get("type")     in _ATOMIC_TYPES]
 
-        # ── 1. Text/heading/bullet blocks ─────────────────
+        # ── 1. Text / heading / bullet blocks ─────────────
         groups = self._group_by_section(text_blocks)
 
         for g_idx, group in enumerate(groups):
-            combined = "\n\n".join(b["content"] for b in group)
+            combined  = "\n\n".join(b["content"] for b in group)
             meta_base = {
                 "source"      : group[0]["source"],
                 "page"        : group[0]["page"],
@@ -240,13 +200,12 @@ class HierarchicalChunker(BaseChunker):
             parent_texts = self._parent_splitter.split_text(combined)
 
             for p_idx, parent_text in enumerate(parent_texts):
-                parent_id = self._make_parent_id(
+                parent_id   = self._make_parent_id(
                     meta_base["source"],
                     meta_base["page"],
                     meta_base["section_path"],
                     g_idx * 1000 + p_idx,
                 )
-
                 child_texts = self._child_splitter.split_text(parent_text)
                 total_c     = len(child_texts)
 
@@ -255,21 +214,15 @@ class HierarchicalChunker(BaseChunker):
                         continue
                     children.append({
                         **meta_base,
-                        "content"      : child_text,
-                        "parent_id"    : parent_id,
-                        "chunk_index"  : c_idx,
-                        "total_chunks" : total_c,
-                        "strategy"     : self.strategy_name,
+                        "content"       : child_text,
+                        "parent_content": parent_text,   # ← inline parent
+                        "parent_id"     : parent_id,
+                        "chunk_index"   : c_idx,
+                        "total_chunks"  : total_c,
+                        "strategy"      : self.strategy_name,
                     })
 
-                parents[parent_id] = {
-                    **meta_base,
-                    "parent_id"  : parent_id,
-                    "content"    : parent_text,
-                    "child_count": total_c,
-                }
-
-        # ── 2. Atomic blocks — each is own parent+child ───
+        # ── 2. Atomic blocks — self-contained ─────────────
         for a_idx, block in enumerate(atomic_blocks):
             content = block.get("content", "").strip()
             if not content:
@@ -282,26 +235,20 @@ class HierarchicalChunker(BaseChunker):
                 100_000 + a_idx,
             )
 
-            child = {
+            children.append({
                 **block,
-                "parent_id"    : parent_id,
-                "chunk_index"  : 0,
-                "total_chunks" : 1,
-                "strategy"     : self.strategy_name,
-            }
-            parent = {
-                **block,
-                "parent_id"  : parent_id,
-                "child_count": 1,
-            }
-            children.append(child)
-            parents[parent_id] = parent
+                "parent_content": content,   # atomic: parent == child
+                "parent_id"     : parent_id,
+                "chunk_index"   : 0,
+                "total_chunks"  : 1,
+                "strategy"      : self.strategy_name,
+            })
 
         print(
-            f"  [CHUNKER] {len(children)} children, "
-            f"{len(parents)} parents from {len(blocks)} blocks"
+            f"  [CHUNKER] {len(children)} children "
+            f"(parent_content embedded inline) from {len(blocks)} blocks"
         )
-        return children, parents
+        return children
 
     # ── helpers ───────────────────────────────────────────
 
@@ -312,7 +259,6 @@ class HierarchicalChunker(BaseChunker):
 
     @staticmethod
     def _group_by_section(blocks: list[dict]) -> list[list[dict]]:
-        """Group consecutive blocks that share the same section_path."""
         if not blocks:
             return []
         groups: list[list[dict]] = []
@@ -339,15 +285,6 @@ class HierarchicalChunker(BaseChunker):
 # ─────────────────────────────────────────────────────────
 
 class ChunkerFactory:
-    """
-    Returns the right chunker based on strategy name.
-
-    Strategies:
-        "hierarchical" (recommended) — parent-child, best retrieval quality
-        "recursive"                  — flat recursive, good general purpose
-        "fixed"                      — flat fixed-size, fastest
-    """
-
     STRATEGIES: dict[str, type[BaseChunker]] = {
         "hierarchical": HierarchicalChunker,
         "recursive"   : RecursiveChunker,

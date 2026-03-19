@@ -1,8 +1,14 @@
 // src/hooks/useChat.js
+//
+// CHANGES:
+//   - sessionId param removed — backend now derives session from JWT user_id
+//   - streamChat() called without sessionId argument
+//   - Everything else identical
+
 import { useState, useCallback, useRef } from 'react'
 import { streamChat, clearSession } from '../api'
 
-export function useChat(sessionId = 'default') {
+export function useChat() {
   const [messages,   setMessages]   = useState([])
   const [streaming,  setStreaming]  = useState(false)
   const [statusText, setStatusText] = useState('')
@@ -12,11 +18,9 @@ export function useChat(sessionId = 'default') {
     if (streaming) return
     abortRef.current = false
 
-    // Append user message
     const userMsg = { id: Date.now(), role: 'user', content: question }
     setMessages(prev => [...prev, userMsg])
 
-    // Placeholder for assistant
     const assistantId = Date.now() + 1
     setMessages(prev => [...prev, {
       id: assistantId, role: 'assistant', content: '', streaming: true,
@@ -28,14 +32,11 @@ export function useChat(sessionId = 'default') {
 
     try {
       let firstToken = false
-      for await (const event of streamChat(question, sessionId)) {
+      for await (const event of streamChat(question)) {
         if (abortRef.current) break
 
         if (event.type === 'token') {
-          if (!firstToken) {
-            firstToken = true
-            setStatusText('')
-          }
+          if (!firstToken) { firstToken = true; setStatusText('') }
           setMessages(prev => prev.map(m =>
             m.id === assistantId
               ? { ...m, content: m.content + event.token }
@@ -69,12 +70,12 @@ export function useChat(sessionId = 'default') {
       setStreaming(false)
       setStatusText('')
     }
-  }, [streaming, sessionId])
+  }, [streaming])
 
   const clear = useCallback(async () => {
-    await clearSession(sessionId)
+    await clearSession()
     setMessages([])
-  }, [sessionId])
+  }, [])
 
   return { messages, streaming, statusText, send, clear }
 }

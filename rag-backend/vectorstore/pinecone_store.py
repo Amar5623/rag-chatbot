@@ -1,12 +1,17 @@
 # vectorstore/pinecone_store.py
-# IMPROVED — matches QdrantVectorStore metadata exactly:
-#   - add_documents() stores heading, image_path, chunk_index, total_chunks
-#   - search() and search_with_filter() return all fields via _metadata_to_dict()
-#   - _metadata_to_dict() is the Pinecone equivalent of Qdrant's _payload_to_dict()
 #
-# NOTE: Pinecone metadata values must be str/int/float/bool/list only.
-#       image_path and heading are stored as strings (empty string = not present).
-#       chunk_index and total_chunks are stored as int (-1 = not present).
+# CHANGES vs original:
+#   - search() and search_with_filter() now accept query_vector (pre-embedded)
+#     instead of raw query string — matches QdrantVectorStore interface exactly
+#   - delete_by_source(filename) added — deletes all vectors for a file
+#   - count() added — returns total vector count
+#   - list_sources() added — returns distinct source filenames
+#   - parent_content stored in metadata (inline parent, same as Qdrant)
+#   - reset_collection() alias added for interface parity with Qdrant
+#
+# SWITCHING: set VECTOR_STORE=pinecone in .env.
+# Both stores are now fully interchangeable — same method signatures,
+# same return dict structure, same delete interface.
 
 import os
 import sys
@@ -19,33 +24,32 @@ from config import PINECONE_API_KEY, PINECONE_INDEX, PINECONE_CLOUD, PINECONE_RE
 
 class PineconeVectorStore:
     """
-    Cloud-based Pinecone vector store.
-    Requires PINECONE_API_KEY in .env
+    Cloud Pinecone vector store.
 
-    Differences vs Qdrant:
-      ✅ Managed cloud — no local setup
-      ✅ Scales to millions of vectors
-      ❌ Needs internet + API key
-      ❌ Free tier has limits (1 index, 2GB)
+    Fully interface-compatible with QdrantVectorStore:
+      - add_documents(chunks)
+      - search(query_vector, top_k)
+      - search_with_filter(query_vector, filter_by, filter_val, top_k)
+      - delete_by_source(filename) → int
+      - count() → int
+      - list_sources() → list[str]
+      - reset() / reset_collection()
 
-    Metadata stored per chunk (matches QdrantVectorStore exactly):
-        content      — text content (capped at 1000 chars — Pinecone limit)
-        source       — original filename
-        page         — page number
-        type         — text / table / image / csv / xlsx
-        heading      — section heading detected by pdf_loader (or "")
-        image_path   — absolute path to image on disk (or "")
-        chunk_index  — position within source document (-1 if not set)
-        total_chunks — total chunks for source document (-1 if not set)
+    Switch from Qdrant to Pinecone with one .env change:
+        VECTOR_STORE=pinecone
+        PINECONE_API_KEY=your-key-here
     """
+
+    # Pinecone metadata value limit per field
+    _CONTENT_LIMIT = 1000
 
     def __init__(
         self,
-        embedder        : BaseEmbedder = None,
-        index_name      : str          = PINECONE_INDEX,
-        embedding_dim   : int          = EMBEDDING_DIM,
-        cloud           : str          = PINECONE_CLOUD,
-        region          : str          = PINECONE_REGION,
+        embedder      : BaseEmbedder = None,
+        index_name    : str          = PINECONE_INDEX,
+        embedding_dim : int          = EMBEDDING_DIM,
+        cloud         : str          = PINECONE_CLOUD,
+        region        : str          = PINECONE_REGION,
     ):
         self.embedder      = embedder or EmbedderFactory.get("huggingface")
         self.index_name    = index_name
@@ -57,12 +61,12 @@ class PineconeVectorStore:
         self.index = self.pc.Index(self.index_name)
         print(f"  [PINECONE] ✅ Ready! Index: '{self.index_name}'")
 
-    # ── SETUP ────────────────────────────────
+    # ── SETUP ────────────────────────────────────────────────
 
     def _ensure_index(self, cloud: str, region: str) -> None:
         existing = [i.name for i in self.pc.list_indexes()]
         if self.index_name not in existing:
-            print(f"  [PINECONE] Creating new index: '{self.index_name}'...")
+            print(f"  [PINECONE] Creating index '{self.index_name}'...")
             self.pc.create_index(
                 name      = self.index_name,
                 dimension = self.embedding_dim,
@@ -77,24 +81,22 @@ class PineconeVectorStore:
         else:
             print(f"  [PINECONE] Using existing index: '{self.index_name}'")
 
-    def reset_index(self) -> None:
+    def reset(self) -> None:
+        """Wipe all vectors from the index."""
         self.index.delete(delete_all=True)
         print(f"  [PINECONE] Index '{self.index_name}' cleared.")
 
-    # ── WRITE ────────────────────────────────
+    # Keep alias for interface parity with QdrantVectorStore
+    def reset_collection(self) -> None:
+        self.reset()
+
+    # ── WRITE ────────────────────────────────────────────────
 
     def add_documents(self, chunks: list[dict]) -> None:
         """
         Embed all chunks and upsert into Pinecone.
-
-        IMPROVED: stores all metadata fields so search results have
-        the same structure as QdrantVectorStore — heading, image_path,
-        chunk_index, total_chunks are all preserved.
-
-        Pinecone metadata rules:
-          - Values must be str / int / float / bool / list
-          - Total metadata per vector should stay under ~40KB
-          - content is capped at 1000 chars to respect this limit
+        Stores parent_content inline (same as Qdrant) — capped at 4000 chars
+        since parent chunks are larger than child chunks.
         """
         if not chunks:
             print("  [PINECONE] No chunks to add.")
@@ -106,110 +108,138 @@ class PineconeVectorStore:
         records = []
         for i, (chunk, vector) in enumerate(zip(chunks, vectors)):
             metadata = {
-                # Core fields
-                "content"      : str(chunk.get("content", ""))[:1000],
-                "source"       : str(chunk.get("source", "unknown")),
-                "page"         : int(chunk.get("page") or 0),
-                "type"         : str(chunk.get("type", "text")),
-                # NEW: heading + image_path from improved pdf_loader
-                "heading"      : str(chunk.get("heading", "")),
-                "image_path"   : str(chunk.get("image_path", "")),
-                # NEW: positional metadata from improved chunker
-                "chunk_index"  : int(chunk.get("chunk_index")  if chunk.get("chunk_index")  is not None else -1),
-                "total_chunks" : int(chunk.get("total_chunks") if chunk.get("total_chunks") is not None else -1),
+                "content"       : str(chunk.get("content",        ""))[:self._CONTENT_LIMIT],
+                "parent_content": str(chunk.get("parent_content", ""))[:4000],
+                "source"        : str(chunk.get("source",         "unknown")),
+                "page"          : int(chunk.get("page") or 0),
+                "type"          : str(chunk.get("type",           "text")),
+                "heading"       : str(chunk.get("heading",        "")),
+                "section_path"  : str(chunk.get("section_path",   "")),
+                "image_path"    : str(chunk.get("image_path",     "")),
+                "parent_id"     : str(chunk.get("parent_id",      "")),
+                "chunk_index"   : int(chunk.get("chunk_index")  if chunk.get("chunk_index")  is not None else -1),
+                "total_chunks"  : int(chunk.get("total_chunks") if chunk.get("total_chunks") is not None else -1),
             }
             records.append({
-                "id"      : f"chunk_{i}_{hash(chunk['content']) % 100000}",
+                "id"      : f"chunk_{i}_{hash(chunk.get('content','')) % 10_000_000}",
                 "values"  : vector,
                 "metadata": metadata,
             })
 
-        # Pinecone upsert limit = 100 vectors per batch
         batch_size = 100
         for i in range(0, len(records), batch_size):
             self.index.upsert(vectors=records[i:i + batch_size])
 
-        print(f"  [PINECONE] ✅ Added {len(records)} vectors to '{self.index_name}'")
+        print(f"  [PINECONE] ✅ Upserted {len(records)} vectors to '{self.index_name}'")
 
-    # ── METADATA HELPER ──────────────────────
+    # ── DELETE ───────────────────────────────────────────────
+
+    def delete_by_source(self, filename: str) -> int:
+        """
+        Delete all vectors whose metadata source == filename.
+        Pinecone doesn't return a deletion count directly,
+        so we count before and after.
+        Returns number of vectors deleted.
+        """
+        before = self.count()
+
+        # Pinecone delete with metadata filter
+        self.index.delete(
+            filter={"source": {"$eq": filename}}
+        )
+
+        after   = self.count()
+        deleted = max(before - after, 0)
+        print(f"  [PINECONE] Deleted ~{deleted} vectors for source='{filename}'")
+        return deleted
+
+    # ── METADATA HELPER ──────────────────────────────────────
 
     @staticmethod
     def _metadata_to_dict(r) -> dict:
         """
-        Convert a Pinecone search result into a clean dict.
-        Mirrors QdrantVectorStore._payload_to_dict() exactly so the
-        rest of the pipeline (retriever → reranker → chain → UI)
-        is fully interchangeable between the two stores.
-
-        Fields returned:
-            content      — text content
-            score        — cosine similarity score
-            source       — original filename
-            page         — page number
-            type         — text / table / image / csv / xlsx
-            heading      — section heading (or "")
-            image_path   — absolute path to saved image (or "")
-            chunk_index  — position within document (-1 if unknown)
-            total_chunks — total chunks for document (-1 if unknown)
+        Convert a Pinecone result into a clean dict.
+        Identical structure to QdrantVectorStore._payload_to_dict()
+        so the rest of the pipeline is fully interchangeable.
         """
         m = r.metadata
         return {
-            "content"      : m.get("content", ""),
-            "score"        : round(r.score, 4),
-            "source"       : m.get("source", "unknown"),
-            "page"         : m.get("page", None),
-            "type"         : m.get("type", "text"),
-            "heading"      : m.get("heading", ""),
-            "image_path"   : m.get("image_path", ""),
-            "chunk_index"  : m.get("chunk_index", -1),
-            "total_chunks" : m.get("total_chunks", -1),
+            "content"       : m.get("content",        ""),
+            "score"         : round(r.score, 4),
+            "source"        : m.get("source",         "unknown"),
+            "page"          : m.get("page",           None),
+            "type"          : m.get("type",           "text"),
+            "heading"       : m.get("heading",        ""),
+            "section_path"  : m.get("section_path",   ""),
+            "image_path"    : m.get("image_path",     ""),
+            "parent_id"     : m.get("parent_id",      ""),
+            "parent_content": m.get("parent_content", ""),
+            "chunk_index"   : m.get("chunk_index",    -1),
+            "total_chunks"  : m.get("total_chunks",   -1),
         }
 
-    # ── READ ─────────────────────────────────
+    # ── READ ─────────────────────────────────────────────────
 
-    def search(self, query: str, top_k: int = 5) -> list[dict]:
-        """
-        Embed the query and find top_k most similar chunks.
-        Returns full metadata via _metadata_to_dict() —
-        same structure as QdrantVectorStore.search().
-        """
-        query_vector = self.embedder.embed_text(query)
-
+    def search(
+        self,
+        query_vector: list[float],   # pre-embedded — matches Qdrant interface
+        top_k       : int = 5,
+    ) -> list[dict]:
         results = self.index.query(
-            vector          = query_vector,
-            top_k           = top_k,
-            include_metadata= True,
+            vector           = query_vector,
+            top_k            = top_k,
+            include_metadata = True,
         )
-
         return [self._metadata_to_dict(r) for r in results.matches]
 
     def search_with_filter(
         self,
-        query      : str,
-        filter_by  : str,
-        filter_val : str,
-        top_k      : int = 5,
+        query_vector: list[float],   # pre-embedded — matches Qdrant interface
+        filter_by   : str,
+        filter_val  : str,
+        top_k       : int = 5,
     ) -> list[dict]:
-        """
-        Search with metadata filtering.
-
-        Usage examples:
-            store.search_with_filter("revenue",      "source",  "sales.csv")
-            store.search_with_filter("Q3 breakdown", "type",    "table")
-            store.search_with_filter("steps",        "heading", "Installation")
-        """
-        query_vector = self.embedder.embed_text(query)
-
         results = self.index.query(
-            vector          = query_vector,
-            top_k           = top_k,
-            include_metadata= True,
-            filter          = {filter_by: {"$eq": filter_val}},
+            vector           = query_vector,
+            top_k            = top_k,
+            include_metadata = True,
+            filter           = {filter_by: {"$eq": filter_val}},
         )
-
         return [self._metadata_to_dict(r) for r in results.matches]
 
-    # ── STATS ────────────────────────────────
+    # ── STATS ────────────────────────────────────────────────
+
+    def count(self) -> int:
+        try:
+            stats = self.index.describe_index_stats()
+            return stats.total_vector_count or 0
+        except Exception:
+            return 0
+
+    def list_sources(self) -> list[str]:
+        """
+        Pinecone doesn't support a native distinct-values query.
+        We fetch a large batch of vectors and collect unique sources.
+        For small-to-medium indexes this is fine.
+        For very large indexes (100k+ vectors) consider maintaining
+        a separate source registry.
+        """
+        try:
+            # Fetch up to 10k random vectors with only source metadata
+            results = self.index.query(
+                vector           = [0.0] * self.embedding_dim,
+                top_k            = 10_000,
+                include_metadata = True,
+                include_values   = False,
+            )
+            sources = {
+                r.metadata.get("source", "")
+                for r in results.matches
+                if r.metadata.get("source")
+            }
+            return sorted(sources)
+        except Exception:
+            return []
 
     def get_stats(self) -> dict:
         stats = self.index.describe_index_stats()

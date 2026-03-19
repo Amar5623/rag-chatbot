@@ -252,6 +252,7 @@ class RAGChain:
         # ── Memory ────────────────────────────────────────
         self.history    = self.llm.history
         self._last_type = QueryRouter.DOCUMENT
+        self._source_filter: str | None = None
 
         print(f"\n  [RAG CHAIN] ✅ Ready!")
         print(f"  [RAG CHAIN] LLM       : {self.llm.model_name}")
@@ -271,7 +272,11 @@ class RAGChain:
     # ── RETRIEVAL ─────────────────────────────────────────
 
     def _retrieve(self, question: str) -> RetrievalResult:
-        retrieval = self.retriever.retrieve(question)
+        retrieval = self.retriever.retrieve(
+            question,
+            filter_field = "source" if self._source_filter else None,
+            filter_value = self._source_filter,
+        )
         if self.use_reranker and self.reranker and len(retrieval) > 0:
             retrieval = self.reranker.rerank(
                 query     = question,
@@ -316,13 +321,12 @@ class RAGChain:
         )
 
         try:
-            resp = self.llm.client.chat.completions.create(
-                model       = self.llm.model_name,
-                messages    = [{"role": "user", "content": prompt}],
+            result   = self.llm.generate(
+                prompt      = prompt,
                 max_tokens  = 80,
                 temperature = 0.1,
             )
-            expanded = resp.choices[0].message.content.strip().strip('"').strip("'")
+            expanded = result["content"].strip().strip('"').strip("'")
             if expanded:
                 print(f"  [QUERY EXPAND] '{question[:40]}' → '{expanded[:60]}'")
                 return expanded
@@ -575,6 +579,19 @@ class RAGChain:
         """Clear both sliding window AND rolling summary."""
         self.llm.reset_history()
         print("  [RAG CHAIN] Memory fully cleared.")
+    
+    def set_source_filter(self, filename: str) -> None:
+        """Pin retrieval to a single source file."""
+        self._source_filter = filename
+        print(f"  [RAG CHAIN] Pinned to: '{filename}'")
+ 
+    def clear_source_filter(self) -> None:
+        """Unpin — return to full KB search."""
+        self._source_filter = None
+        print(f"  [RAG CHAIN] Pin cleared")
+ 
+    def get_source_filter(self) -> str | None:
+        return self._source_filter
 
     def get_history(self) -> list[dict]:
         return self.history.to_messages()

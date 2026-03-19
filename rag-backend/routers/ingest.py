@@ -1,184 +1,227 @@
 # routers/ingest.py
+#
+# CHANGES:
+#   - JWT protection on all endpoints via Depends(get_current_user)
+#   - DELETE /ingest/{filename} added — deletes vectors + BM25 + hash entry
+#   - Loaders now instantiated with file_path (matching original BaseLoader signature)
+#   - chunk_hierarchical() returns only children (parent inline)
+#   - Hash registry kept for duplicate prevention
+#   - PIN FOCUS: optional source filter passed to retriever via session
+
 import hashlib
+import json
 import os
-import sqlite3
-import tempfile
+import shutil
+import uuid
 from pathlib import Path
-from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 
-from ingestion.chunker    import ChunkerFactory, HierarchicalChunker
+from auth.dependencies import get_current_user
+from config import settings
+from services import rag_service as _svc
 from ingestion.csv_loader  import CSVLoader
 from ingestion.pdf_loader  import PDFLoader
 from ingestion.text_loader import TextLoader
 from ingestion.xlsx_loader import XLSXLoader
+from schemas import DeleteFileResponse, IngestResponse, IngestStatusResponse
 from services import rag_service
-from config import settings
 
-router = APIRouter(prefix="/ingest", tags=["ingest"])
+router = APIRouter(tags=["ingest"])
 
-_LOADERS = {
-    ".pdf" : PDFLoader,
-    ".csv" : CSVLoader,
-    ".xlsx": XLSXLoader,
-    ".txt" : TextLoader,
-}
-
-_chunker: HierarchicalChunker = None
+# ── Hash registry ─────────────────────────────────────────────
+_HASH_FILE = Path(settings.qdrant_path).parent / "file_hashes.json"
 
 
-def _get_chunker() -> HierarchicalChunker:
-    global _chunker
-    if _chunker is None:
-        _chunker = ChunkerFactory.get("hierarchical")
-    return _chunker
+def _load_hashes() -> dict:
+    if _HASH_FILE.exists():
+        try:
+            return json.loads(_HASH_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
 
 
-# ── Deduplication helpers ─────────────────────────────────────
-
-def _hash_db_path() -> str:
-    return str(Path(settings.qdrant_path).parent / "hashes.db")
-
-
-def _init_hash_db() -> None:
-    with sqlite3.connect(_hash_db_path()) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS hashes (
-                hash     TEXT PRIMARY KEY,
-                filename TEXT NOT NULL
-            )
-        """)
-        conn.commit()
-
-
-def _is_duplicate(file_hash: str) -> bool:
-    _init_hash_db()
-    with sqlite3.connect(_hash_db_path()) as conn:
-        return conn.execute(
-            "SELECT 1 FROM hashes WHERE hash = ?", (file_hash,)
-        ).fetchone() is not None
-
-
-def _register_hash(file_hash: str, filename: str) -> None:
-    with sqlite3.connect(_hash_db_path()) as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO hashes (hash, filename) VALUES (?, ?)",
-            (file_hash, filename),
-        )
-        conn.commit()
+def _save_hashes(hashes: dict) -> None:
+    _HASH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _HASH_FILE.write_text(json.dumps(hashes, indent=2))
 
 
 def _wipe_hashes() -> None:
-    _init_hash_db()
-    with sqlite3.connect(_hash_db_path()) as conn:
-        conn.execute("DELETE FROM hashes")
-        conn.commit()
+    if _HASH_FILE.exists():
+        _HASH_FILE.unlink()
 
 
-# ── Background ingestion ──────────────────────────────────────
+def _remove_hash_for_file(filename: str) -> None:
+    hashes  = _load_hashes()
+    updated = {h: f for h, f in hashes.items() if f != filename}
+    _save_hashes(updated)
 
-async def _run_ingestion(
-    files_data: list[tuple[str, str, bytes]],
-    task_id: str,
-) -> None:
-    rag_service.set_task(task_id, "running", 0, "Starting ingestion…")
 
+# ── Loader dispatch ───────────────────────────────────────────
+# Each loader is instantiated with file_path (BaseLoader.__init__ requires it)
+
+def _get_loader(tmp_path: str, filename: str):
+    ext = Path(filename).suffix.lower()
+    if ext == ".pdf":
+        return PDFLoader(tmp_path)
+    if ext == ".csv":
+        return CSVLoader(tmp_path)
+    if ext == ".xlsx":
+        return XLSXLoader(tmp_path)
+    if ext == ".txt":
+        return TextLoader(tmp_path)
+    return None
+
+
+# ── Core ingest logic (runs in threadpool) ────────────────────
+
+def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
+    """
+    file_paths: list of (tmp_path, original_filename)
+    """
+    hashes       = _load_hashes()
+    chunker      = _svc.get_chunker()
     vector_store = rag_service.get_vector_store()
     bm25_store   = rag_service.get_bm25_store()
-    parent_store = rag_service.get_parent_store()
-    chunker      = _get_chunker()
 
-    all_children: list[dict] = []
-    all_parents:  dict       = {}
-    indexed:  list[str]      = []
-    skipped:  list[str]      = []
-    total = len(files_data)
+    files_indexed: list[str] = []
+    skipped      : list[str] = []
+    all_children : list[dict] = []
 
-    for i, (filename, ext, data) in enumerate(files_data):
-        progress = int((i / total) * 80)
-        rag_service.set_task(task_id, "running", progress, f"Processing {filename}…")
+    for tmp_path, filename in file_paths:
+        # ── 1. Duplicate check ────────────────────────────
+        raw   = Path(tmp_path).read_bytes()
+        fhash = hashlib.sha256(raw).hexdigest()
 
-        # ── Dedup check ───────────────────────────────────────
-        file_hash = hashlib.sha256(data).hexdigest()
-        if _is_duplicate(file_hash):
+        if fhash in hashes:
+            print(f"  [INGEST] Skipping duplicate: {filename}")
             skipped.append(filename)
             continue
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            tmp.write(data)
-            tmp_path = tmp.name
+        # ── 2. Load ───────────────────────────────────────
+        loader = _get_loader(tmp_path, filename)
+        if not loader:
+            print(f"  [INGEST] Unsupported file type: {filename}")
+            skipped.append(filename)
+            continue
 
         try:
-            docs = _LOADERS[ext](tmp_path).load()
-            for d in docs:
-                d["source"] = filename
-
-            children, parents = chunker.chunk_hierarchical(docs)
-            for c in children:
-                c["source"] = filename
-
-            all_children.extend(children)
-            all_parents.update(parents)
-            indexed.append(filename)
-            _register_hash(file_hash, filename)
-
+            blocks = loader.load()
         except Exception as e:
-            rag_service.set_task(task_id, "running", progress, f"Error on {filename}: {e}")
-        finally:
-            os.unlink(tmp_path)
+            print(f"  [INGEST] Load failed for {filename}: {e}")
+            skipped.append(filename)
+            continue
 
-    # ── Persist ───────────────────────────────────────────────
+        if not blocks:
+            skipped.append(filename)
+            continue
+
+        # Ensure source is stamped with the original filename
+        for b in blocks:
+            b["source"] = filename
+
+        # ── 3. Chunk — strategy determined by CHUNKER setting ────
+        # HierarchicalChunker  → chunk_hierarchical() returns flat list with parent_content inline
+        # RecursiveChunker / FixedSizeChunker → chunk_documents() returns flat list (no parent)
+        from ingestion.chunker import HierarchicalChunker
+        if isinstance(chunker, HierarchicalChunker):
+            children = chunker.chunk_hierarchical(blocks)
+        else:
+            children = chunker.chunk_documents(blocks)
+
+        # ── 4. Collect ────────────────────────────────────
+        all_children.extend(children)
+        files_indexed.append(filename)
+        hashes[fhash] = filename
+
+    # ── 5. Index ──────────────────────────────────────────
     if all_children:
-        rag_service.set_task(task_id, "running", 85, "Indexing vectors…")
         vector_store.add_documents(all_children)
-
-        rag_service.set_task(task_id, "running", 90, "Updating BM25…")
         bm25_store.add(all_children)
 
-        rag_service.set_task(task_id, "running", 95, "Saving parents…")
-        parent_store.add(all_parents)
+    _save_hashes(hashes)
 
-    rag_service.set_task(
-        task_id, "done", 100,
-        f"Indexed {len(indexed)} file(s). Skipped {len(skipped)} duplicate(s).",
-        result={
-            "files_indexed" : indexed,
-            "files_skipped" : skipped,
-            "total_chunks"  : len(all_children),
-            "total_parents" : len(all_parents),
-        },
-    )
+    return {
+        "files_indexed": files_indexed,
+        "skipped"      : skipped,
+        "total_chunks" : len(all_children),
+        "total_parents": len(all_children),
+    }
 
 
 # ── Endpoints ─────────────────────────────────────────────────
 
-@router.post("")
-async def ingest_files(
-    background_tasks: BackgroundTasks,
-    files: list[UploadFile] = File(...),
+@router.post("/ingest", response_model=IngestResponse)
+async def ingest(
+    files       : list[UploadFile] = File(...),
+    current_user: dict             = Depends(get_current_user),
 ):
     if not files:
-        raise HTTPException(400, "No files provided")
+        raise HTTPException(status_code=400, detail="No files provided.")
 
-    files_data: list[tuple[str, str, bytes]] = []
-    for f in files:
-        ext = Path(f.filename).suffix.lower()
-        if ext not in _LOADERS:
-            raise HTTPException(400, f"Unsupported file type: {ext}. Allowed: {list(_LOADERS)}")
-        data = await f.read()
-        files_data.append((f.filename, ext, data))
+    tmp_dir    = Path("/tmp") / f"rag_ingest_{uuid.uuid4().hex}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    file_paths : list[tuple[str, str]] = []
 
-    task_id = uuid4().hex
-    rag_service.set_task(task_id, "queued", 0, "Queued for processing")
-    background_tasks.add_task(_run_ingestion, files_data, task_id)
+    try:
+        for upload in files:
+            tmp_path = tmp_dir / upload.filename
+            content  = await upload.read()
+            tmp_path.write_bytes(content)
+            file_paths.append((str(tmp_path), upload.filename))
 
-    return {"task_id": task_id, "status": "queued"}
+        result = await run_in_threadpool(_ingest_files_sync, file_paths)
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return IngestResponse(
+        status        = "ok",
+        files_indexed = result["files_indexed"],
+        total_chunks  = result["total_chunks"],
+        total_parents = result["total_parents"],
+        message       = (
+            f"Indexed {len(result['files_indexed'])} file(s). "
+            f"Skipped {len(result['skipped'])} duplicate(s)."
+        ),
+    )
 
 
-@router.get("/status/{task_id}")
-async def ingest_status(task_id: str):
+@router.delete("/ingest/{filename}", response_model=DeleteFileResponse)
+async def delete_file(
+    filename    : str,
+    current_user: dict = Depends(get_current_user),
+):
+    vector_store = rag_service.get_vector_store()
+    sources = vector_store.list_sources()
+    if filename not in sources:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"File '{filename}' not found in the knowledge base.",
+        )
+
+    result = await run_in_threadpool(rag_service.delete_file_from_stores, filename)
+    _remove_hash_for_file(filename)
+
+    return DeleteFileResponse(
+        status          = "ok",
+        filename        = filename,
+        vectors_deleted = result["vectors_deleted"],
+        message         = (
+            f"Deleted '{filename}': "
+            f"{result['vectors_deleted']} vectors removed."
+        ),
+    )
+
+
+@router.get("/ingest/status/{task_id}", response_model=IngestStatusResponse)
+async def ingest_status(
+    task_id     : str,
+    current_user: dict = Depends(get_current_user),
+):
     task = rag_service.get_task(task_id)
     if not task:
-        raise HTTPException(404, f"Task '{task_id}' not found")
-    return task
+        raise HTTPException(status_code=404, detail="Task not found.")
+    return IngestStatusResponse(**task)

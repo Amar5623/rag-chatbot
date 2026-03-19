@@ -53,7 +53,7 @@ class StatsResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status          : str
-    version         : str = "2.0.0"
+    version         : str = "2.2.0"
     groq_configured : bool
 
 
@@ -66,14 +66,24 @@ class WipeResponse(BaseModel):
     status  : str
     message : str
 
+
+class DeleteFileResponse(BaseModel):
+    status        : str
+    filename      : str
+    vectors_deleted: int
+    message       : str
+
+
 class IngestStatusResponse(BaseModel):
     status  : str
     progress: int = 0
     message : str = ""
     result  : dict = {}
 
+
 __all__ = [
     "ChatRequest", "ClearRequest",
     "Citation", "ChatResponse", "IngestResponse",
-    "StatsResponse", "HealthResponse", "DocumentsResponse", "WipeResponse", "IngestStatusResponse"
+    "StatsResponse", "HealthResponse", "DocumentsResponse",
+    "WipeResponse", "DeleteFileResponse", "IngestStatusResponse",
 ]

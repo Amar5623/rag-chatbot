@@ -1,7 +1,18 @@
-import { useState, useEffect } from 'react'
-import { fetchStats, ingestFiles, wipeCollection } from '../api'
+// src/components/Sidebar.jsx
+//
+// CHANGES:
+//   - 📌 pin button added next to each indexed file
+//   - pinned file highlighted with accent border
+//   - pinnedFile + onPin + onUnpin props accepted from App.jsx
 
-export default function Sidebar({ onClearChat, kbReady, setKbReady, refreshKey }) {
+import { useState, useEffect } from 'react'
+import { fetchStats, ingestFiles, wipeCollection, deleteFile, pinFile, unpinFile } from '../api'
+
+export default function Sidebar({
+  onClearChat, kbReady, setKbReady, refreshKey,
+  currentUser, onLogout,
+  pinnedFile, onPin, onUnpin,
+}) {
   const [collapsed, setCollapsed] = useState(false)
   const [stats,     setStats]     = useState(null)
   const [drag,      setDrag]      = useState(false)
@@ -17,12 +28,8 @@ export default function Sidebar({ onClearChat, kbReady, setKbReady, refreshKey }
     } catch { /* backend not ready yet */ }
   }
 
-  // Fetch on mount + whenever refreshKey increments (after ChatWindow upload)
   useEffect(() => { refresh() }, [refreshKey])
 
-  /* ── File handling ── */
-
-  // Using a unique id for the label→input pattern — always reliable cross-browser
   const INPUT_ID = 'sidebar-file-input'
 
   const addFiles = files => {
@@ -32,19 +39,9 @@ export default function Sidebar({ onClearChat, kbReady, setKbReady, refreshKey }
     if (valid.length) setPending(p => [...p, ...valid])
   }
 
-  const handleDrop = e => {
-    e.preventDefault(); setDrag(false)
-    addFiles(e.dataTransfer.files)
-  }
-
-  // label→input onChange — fires reliably because browser owns the click
-  const handleChange = e => {
-    addFiles(e.target.files)
-    // Reset so the same file can be selected again
-    e.target.value = ''
-  }
-
-  const removeFile = i => setPending(p => p.filter((_, j) => j !== i))
+  const handleDrop   = e => { e.preventDefault(); setDrag(false); addFiles(e.dataTransfer.files) }
+  const handleChange = e => { addFiles(e.target.files); e.target.value = '' }
+  const removeFile   = i => setPending(p => p.filter((_, j) => j !== i))
 
   const doIngest = async () => {
     if (!pending.length) return
@@ -58,9 +55,36 @@ export default function Sidebar({ onClearChat, kbReady, setKbReady, refreshKey }
   const doWipe = async () => {
     if (!confirm('Wipe the entire knowledge base? This cannot be undone.')) return
     setBusy(true); setBusyMsg('Wiping…')
-    try { await wipeCollection(); await refresh(); onClearChat() }
-    catch (e) { alert(e.message) }
+    try {
+      await wipeCollection()
+      onUnpin?.()   // clear any active pin
+      await refresh()
+      onClearChat()
+    } catch (e) { alert(e.message) }
     finally { setBusy(false); setBusyMsg('') }
+  }
+
+  const doDeleteFile = async (filename) => {
+    if (!confirm(`Delete "${filename}" from the knowledge base?\nThis removes all its vectors and cannot be undone.`)) return
+    setBusy(true); setBusyMsg(`Deleting ${filename}…`)
+    try {
+      if (pinnedFile === filename) await onUnpin?.()
+      await deleteFile(filename)
+      await refresh()
+    } catch (e) { alert(e.message) }
+    finally { setBusy(false); setBusyMsg('') }
+  }
+
+  const doTogglePin = async (filename) => {
+    try {
+      if (pinnedFile === filename) {
+        await unpinFile()
+        onUnpin?.()
+      } else {
+        await pinFile(filename)
+        onPin?.(filename)
+      }
+    } catch (e) { alert(e.message) }
   }
 
   const extIcon = n => {
@@ -71,7 +95,6 @@ export default function Sidebar({ onClearChat, kbReady, setKbReady, refreshKey }
     return '📝'
   }
 
-  /* ── Styles ── */
   const W = collapsed ? 52 : 268
 
   return (
@@ -85,7 +108,7 @@ export default function Sidebar({ onClearChat, kbReady, setKbReady, refreshKey }
       flexShrink: 0,
     }}>
 
-      {/* ── Header ── */}
+      {/* Header */}
       <div style={{
         height: 56, padding: '0 14px',
         borderBottom: '1px solid var(--border)',
@@ -97,38 +120,27 @@ export default function Sidebar({ onClearChat, kbReady, setKbReady, refreshKey }
           <div style={{ display: 'flex', alignItems: 'center', gap: 9, overflow: 'hidden' }}>
             <Logo />
             <div style={{ overflow: 'hidden' }}>
-              <div style={{ fontFamily: 'var(--font-display)', fontWeight: 800, fontSize: '.95rem', color: 'var(--text-0)', whiteSpace: 'nowrap' }}>
-                DocMind
-              </div>
-              <div style={{ fontSize: '.58rem', color: 'var(--text-3)', letterSpacing: '.1em', textTransform: 'uppercase' }}>
-                RAG Intelligence
-              </div>
+              <div style={{ fontFamily: 'var(--font-display)', fontWeight: 800, fontSize: '.95rem', color: 'var(--text-0)', whiteSpace: 'nowrap' }}>DocMind</div>
+              <div style={{ fontSize: '.58rem', color: 'var(--text-3)', letterSpacing: '.1em', textTransform: 'uppercase' }}>RAG Intelligence</div>
             </div>
           </div>
         )}
         {collapsed && <Logo />}
-
-        {/* Collapse toggle */}
         <button onClick={() => setCollapsed(c => !c)} style={{
-          width: 26, height: 26, borderRadius: 6,
-          border: '1px solid var(--border)',
-          background: 'transparent', cursor: 'pointer',
-          color: 'var(--text-2)', display: 'flex',
-          alignItems: 'center', justifyContent: 'center',
-          fontSize: '.75rem', flexShrink: 0,
-          transition: 'all .15s',
-        }}
-          title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-        >
+          width: 26, height: 26, borderRadius: 6, border: '1px solid var(--border)',
+          background: 'transparent', cursor: 'pointer', color: 'var(--text-2)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: '.75rem', flexShrink: 0, transition: 'all .15s',
+        }} title={collapsed ? 'Expand' : 'Collapse'}>
           {collapsed ? '›' : '‹'}
         </button>
       </div>
 
-      {/* ── Body (hidden when collapsed) ── */}
+      {/* Body */}
       {!collapsed && (
-        <div style={{ flex: 1, overflowY: 'auto', padding: '14px 14px' }}>
+        <div style={{ flex: 1, overflowY: 'auto', padding: '14px 14px', display: 'flex', flexDirection: 'column' }}>
 
-          {/* Status pill */}
+          {/* KB status pill */}
           <div style={{
             display: 'inline-flex', alignItems: 'center', gap: 6, marginBottom: 16,
             background: kbReady ? 'rgba(45,212,191,.08)' : 'rgba(255,255,255,.03)',
@@ -146,7 +158,6 @@ export default function Sidebar({ onClearChat, kbReady, setKbReady, refreshKey }
 
           <SLabel>Upload documents</SLabel>
 
-          {/* Drop zone — label wraps the hidden input for reliable browser file dialog */}
           <label
             htmlFor={INPUT_ID}
             onDragOver={e => { e.preventDefault(); setDrag(true) }}
@@ -170,17 +181,9 @@ export default function Sidebar({ onClearChat, kbReady, setKbReady, refreshKey }
             </div>
           </label>
 
-          {/* Hidden file input — triggered by label above */}
-          <input
-            id={INPUT_ID}
-            type="file"
-            multiple
-            accept=".pdf,.csv,.xlsx,.txt"
-            onChange={handleChange}
-            style={{ display: 'none' }}
-          />
+          <input id={INPUT_ID} type="file" multiple accept=".pdf,.csv,.xlsx,.txt"
+            onChange={handleChange} style={{ display: 'none' }} />
 
-          {/* Pending file list */}
           {pending.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 3, marginBottom: 8 }}>
               {pending.map((f, i) => (
@@ -191,45 +194,35 @@ export default function Sidebar({ onClearChat, kbReady, setKbReady, refreshKey }
                   fontSize: '.71rem', color: 'var(--text-1)',
                 }}>
                   <span style={{ fontSize: 11, flexShrink: 0 }}>{extIcon(f.name)}</span>
-                  <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {f.name}
-                  </span>
-                  <span
-                    onClick={e => { e.preventDefault(); removeFile(i) }}
-                    style={{ cursor: 'pointer', color: 'var(--text-3)', lineHeight: 1, flexShrink: 0 }}
-                  >✕</span>
+                  <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                  <span onClick={e => { e.preventDefault(); removeFile(i) }}
+                    style={{ cursor: 'pointer', color: 'var(--text-3)', lineHeight: 1, flexShrink: 0 }}>✕</span>
                 </div>
               ))}
             </div>
           )}
 
           <SBtn primary onClick={doIngest} disabled={!pending.length || busy}>
-            {busy ? busyMsg : pending.length
-              ? `Index ${pending.length} file${pending.length > 1 ? 's' : ''}`
-              : 'Select files above'}
+            {busy ? busyMsg : pending.length ? `Index ${pending.length} file${pending.length > 1 ? 's' : ''}` : 'Select files above'}
           </SBtn>
 
-          {/* Chat actions */}
           {kbReady && (<>
             <SLabel>Chat</SLabel>
             <SBtn onClick={onClearChat} style={{ marginBottom: 6 }}>Clear conversation</SBtn>
             <SBtn danger onClick={doWipe}>Wipe knowledge base</SBtn>
           </>)}
 
-          {/* Stats */}
           {stats && (<>
             <SLabel>Stats</SLabel>
             {[
               ['Vectors',  stats.total_vectors],
               ['BM25',     stats.bm25_docs],
-              ['Parents',  stats.parent_count],
               ['Model',    stats.llm_model?.split('-').slice(0,3).join('-') + '…'],
               ['Embedder', stats.embedding_model?.split('/').pop()],
             ].map(([l, v]) => (
               <div key={l} style={{
                 display: 'flex', justifyContent: 'space-between',
-                padding: '5px 0', borderBottom: '1px solid var(--border)',
-                fontSize: '.72rem',
+                padding: '5px 0', borderBottom: '1px solid var(--border)', fontSize: '.72rem',
               }}>
                 <span style={{ color: 'var(--text-2)' }}>{l}</span>
                 <span style={{ fontFamily: 'var(--font-mono)', fontSize: '.69rem', color: 'var(--accent-text)' }}>{v}</span>
@@ -238,18 +231,75 @@ export default function Sidebar({ onClearChat, kbReady, setKbReady, refreshKey }
 
             {stats.indexed_files?.length > 0 && (<>
               <SLabel>Indexed files</SLabel>
-              {stats.indexed_files.map(f => (
-                <div key={f} style={{
-                  display: 'flex', alignItems: 'center', gap: 6,
-                  padding: '4px 0', borderBottom: '1px solid var(--border)',
-                  fontSize: '.71rem', color: 'var(--text-2)',
-                }}>
-                  <span style={{ fontSize: 11 }}>{extIcon(f)}</span>
-                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f}</span>
-                </div>
-              ))}
+              {stats.indexed_files.map(f => {
+                const isPinned = pinnedFile === f
+                return (
+                  <div key={f} style={{
+                    display: 'flex', alignItems: 'center', gap: 5,
+                    padding: '5px 6px', marginBottom: 3,
+                    borderRadius: 'var(--r-sm)',
+                    background: isPinned ? 'rgba(124,106,247,.1)' : 'transparent',
+                    border: `1px solid ${isPinned ? 'rgba(124,106,247,.35)' : 'var(--border)'}`,
+                    fontSize: '.71rem', color: isPinned ? 'var(--accent-text)' : 'var(--text-2)',
+                    transition: 'all .15s',
+                  }}>
+                    <span style={{ fontSize: 11, flexShrink: 0 }}>{extIcon(f)}</span>
+                    <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f}</span>
+
+                    {/* Pin button */}
+                    <button
+                      onClick={() => doTogglePin(f)}
+                      disabled={busy}
+                      title={isPinned ? 'Unpin (search all files)' : 'Pin (search this file only)'}
+                      style={{
+                        flexShrink: 0, width: 20, height: 20,
+                        border: `1px solid ${isPinned ? 'rgba(124,106,247,.4)' : 'var(--border-md)'}`,
+                        borderRadius: 4, background: isPinned ? 'rgba(124,106,247,.15)' : 'transparent',
+                        cursor: busy ? 'not-allowed' : 'pointer',
+                        color: isPinned ? 'var(--accent-text)' : 'var(--text-3)',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        fontSize: '.7rem', transition: 'all .15s',
+                      }}
+                    >
+                      📌
+                    </button>
+
+                    {/* Delete button */}
+                    <button
+                      onClick={() => doDeleteFile(f)}
+                      disabled={busy}
+                      title={`Delete ${f}`}
+                      style={{
+                        flexShrink: 0, width: 20, height: 20,
+                        border: '1px solid rgba(239,68,68,.2)',
+                        borderRadius: 4, background: 'transparent',
+                        cursor: busy ? 'not-allowed' : 'pointer',
+                        color: 'rgba(239,100,100,.7)',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        fontSize: '.65rem', transition: 'all .15s',
+                      }}
+                    >
+                      🗑
+                    </button>
+                  </div>
+                )
+              })}
             </>)}
           </>)}
+
+          <div style={{ flex: 1, minHeight: 16 }} />
+
+          {currentUser && (
+            <div style={{ borderTop: '1px solid var(--border)', paddingTop: 12, marginTop: 4 }}>
+              <div style={{
+                fontSize: '.68rem', color: 'var(--text-3)', fontFamily: 'var(--font-mono)',
+                marginBottom: 8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              }}>
+                {currentUser.email}
+              </div>
+              <SBtn onClick={onLogout}>Sign out</SBtn>
+            </div>
+          )}
         </div>
       )}
 
@@ -261,19 +311,23 @@ export default function Sidebar({ onClearChat, kbReady, setKbReady, refreshKey }
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             fontSize: '1rem', color: 'var(--text-1)',
           }}>⊕</label>
-          {/* Input already rendered above via INPUT_ID — label just links to it */}
           <div style={{
             width: 8, height: 8, borderRadius: '50%',
             background: kbReady ? 'var(--teal)' : 'var(--text-3)',
             animation: kbReady ? 'pulse 2.5s ease infinite' : 'none',
           }} title={kbReady ? 'KB ready' : 'No documents'}/>
+          {pinnedFile && (
+            <div title={`Pinned: ${pinnedFile}`} style={{
+              width: 8, height: 8, borderRadius: '50%',
+              background: 'var(--accent)',
+              animation: 'glow-pulse 2s ease infinite',
+            }}/>
+          )}
         </div>
       )}
     </aside>
   )
 }
-
-/* ── Helpers ── */
 
 function Logo() {
   return (
@@ -304,12 +358,8 @@ function SBtn({ children, onClick, disabled, primary, danger, style }) {
       fontFamily: 'var(--font-display)', fontWeight: 700,
       fontSize: '.72rem', letterSpacing: '.03em',
       transition: 'all .15s', marginBottom: 6, opacity: disabled ? .5 : 1,
-      border: primary ? 'none'
-        : danger ? '1px solid rgba(239,68,68,.25)'
-        : '1px solid var(--border-md)',
-      background: primary
-        ? 'linear-gradient(135deg, var(--accent), var(--accent-dim))'
-        : 'transparent',
+      border: primary ? 'none' : danger ? '1px solid rgba(239,68,68,.25)' : '1px solid var(--border-md)',
+      background: primary ? 'linear-gradient(135deg, var(--accent), var(--accent-dim))' : 'transparent',
       color: primary ? '#fff' : danger ? 'rgba(239,100,100,.85)' : 'var(--text-1)',
       ...style,
     }}>{children}</button>

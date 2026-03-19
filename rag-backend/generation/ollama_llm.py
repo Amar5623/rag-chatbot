@@ -1,4 +1,9 @@
 # generation/ollama_llm.py
+#
+# CHANGES vs original:
+#   - store_as param added to generate() and stream() — matches GroqLLM interface
+#   - _build_messages() updated to support store_as (same logic as GroqLLM)
+#     Keeps history clean: raw question stored, full context+question sent to API
 
 import os
 import sys
@@ -11,14 +16,11 @@ from config import OLLAMA_MODEL
 
 class OllamaLLM(BaseLLM):
     """
-    Local Ollama LLM — runs fully offline via Ollama daemon.
+    Local Ollama LLM — fully offline via Ollama daemon.
     Requires: `ollama serve` running + model pulled locally.
 
-    ✅ Free  ✅ Private  ✅ No internet needed
+    ✅ Free  ✅ Private  ✅ No internet
     ❌ Slower than Groq  ❌ Needs Ollama running
-
-    Default model : llama3.2  (set in config.py)
-    Features      : streaming, chat history, system prompt, token tracking
     """
 
     DEFAULT_SYSTEM = (
@@ -46,42 +48,42 @@ class OllamaLLM(BaseLLM):
             system_prompt = self.system_prompt,
             max_turns     = max_turns
         )
-        print(f"  [OLLAMA] ✅ Ready!")
-
-    # ── SETUP ────────────────────────────────
+        print(f"  [OLLAMA] Ready!")
 
     def _check_model(self) -> None:
-        """Verify the model is pulled locally. Print warning if not found."""
         try:
             local_models = [m.model for m in ollama.list().models]
-            # model names may have :latest suffix
             names = [m.split(":")[0] for m in local_models]
             if self.model_name.split(":")[0] not in names:
-                print(
-                    f"  [OLLAMA] ⚠️  Model '{self.model_name}' not found locally. "
-                    f"Run: ollama pull {self.model_name}"
-                )
+                print(f"  [OLLAMA]  Model '{self.model_name}' not found. Run: ollama pull {self.model_name}")
             else:
-                print(f"  [OLLAMA] Model found locally ✅")
+                print(f"  [OLLAMA] Model found locally")
         except Exception as e:
-            print(f"  [OLLAMA] ⚠️  Could not connect to Ollama daemon: {e}")
-            print(f"  [OLLAMA]    Make sure `ollama serve` is running.")
-
-    # ── HELPERS ──────────────────────────────
+            print(f"  [OLLAMA]  Could not connect to Ollama daemon: {e}")
 
     def _build_messages(
         self,
         prompt        : str,
         system_prompt : str         = None,
         history       : ChatHistory = None,
+        store_as      : str         = None,
     ) -> list[dict]:
+        """
+        store_as — raw question stored in history (not the full context+question prompt).
+        This keeps conversation history clean across turns, same as GroqLLM.
+        """
         active_history = history or self.history
         if system_prompt:
             active_history.set_system(system_prompt)
-        active_history.add_user(prompt)
-        return active_history.to_messages()
 
-    # ── GENERATE (blocking) ──────────────────
+        active_history.add_user(store_as if store_as else prompt)
+        messages = active_history.to_messages()
+
+        # For this API call only, replace last message with the full prompt
+        if store_as:
+            messages[-1] = {"role": "user", "content": prompt}
+
+        return messages
 
     def generate(
         self,
@@ -90,52 +92,30 @@ class OllamaLLM(BaseLLM):
         history       : ChatHistory = None,
         temperature   : float       = None,
         max_tokens    : int         = None,
+        store_as      : str         = None,   # ← matches GroqLLM
     ) -> dict:
-        """
-        Blocking generation — waits for full response.
-
-        Returns:
-            {
-                "content" : str,
-                "model"   : str,
-                "usage"   : {
-                    "prompt_tokens"    : int,
-                    "completion_tokens": int,
-                    "total_tokens"     : int,
-                }
-            }
-        """
-        messages = self._build_messages(prompt, system_prompt, history)
+        messages = self._build_messages(prompt, system_prompt, history, store_as=store_as)
 
         response = ollama.chat(
-            model   = self.model_name,
-            messages= messages,
-            options = {
+            model    = self.model_name,
+            messages = messages,
+            options  = {
                 "temperature": temperature or self.temperature,
                 "num_predict": max_tokens  or self.max_tokens,
             },
-            stream  = False,
+            stream   = False,
         )
 
-        content = response.message.content
-
+        content        = response.message.content
         active_history = history or self.history
         active_history.add_assistant(content)
 
         usage = {
             "prompt_tokens"    : response.prompt_eval_count or 0,
             "completion_tokens": response.eval_count        or 0,
-            "total_tokens"     : (response.prompt_eval_count or 0)
-                                + (response.eval_count        or 0),
+            "total_tokens"     : (response.prompt_eval_count or 0) + (response.eval_count or 0),
         }
-
-        return {
-            "content": content,
-            "model"  : self.model_name,
-            "usage"  : usage,
-        }
-
-    # ── STREAM (generator) ───────────────────
+        return {"content": content, "model": self.model_name, "usage": usage}
 
     def stream(
         self,
@@ -144,24 +124,21 @@ class OllamaLLM(BaseLLM):
         history       : ChatHistory = None,
         temperature   : float       = None,
         max_tokens    : int         = None,
+        store_as      : str         = None,   # ← matches GroqLLM
     ):
         """
-        Streaming generation — yields text chunks as they arrive.
-
-        Yields:
-            str  — each text chunk
-            dict — final item: { "usage": {...}, "model": str }
+        Yields str tokens then final dict {"model": ..., "usage": {...}}
         """
-        messages = self._build_messages(prompt, system_prompt, history)
+        messages = self._build_messages(prompt, system_prompt, history, store_as=store_as)
 
         response_stream = ollama.chat(
-            model   = self.model_name,
-            messages= messages,
-            options = {
+            model    = self.model_name,
+            messages = messages,
+            options  = {
                 "temperature": temperature or self.temperature,
                 "num_predict": max_tokens  or self.max_tokens,
             },
-            stream  = True,
+            stream   = True,
         )
 
         full_reply = []
@@ -172,33 +149,22 @@ class OllamaLLM(BaseLLM):
             if text:
                 full_reply.append(text)
                 yield text
-
-            # Final chunk carries usage stats
             if chunk.done:
                 usage_data = {
                     "prompt_tokens"    : chunk.prompt_eval_count or 0,
                     "completion_tokens": chunk.eval_count        or 0,
-                    "total_tokens"     : (chunk.prompt_eval_count or 0)
-                                       + (chunk.eval_count        or 0),
+                    "total_tokens"     : (chunk.prompt_eval_count or 0) + (chunk.eval_count or 0),
                 }
 
         active_history = history or self.history
         active_history.add_assistant("".join(full_reply))
-
-        yield {
-            "model": self.model_name,
-            "usage": usage_data,
-        }
-
-    # ── CONVENIENCE ──────────────────────────
+        yield {"model": self.model_name, "usage": usage_data}
 
     def chat(self, message: str, **kwargs) -> str:
-        """Simple one-liner: send message, get back just the text."""
         return self.generate(message, **kwargs)["content"]
 
     def reset_history(self) -> None:
         self.history.clear()
-        print(f"  [OLLAMA] Conversation history cleared.")
 
     def set_system_prompt(self, prompt: str) -> None:
         self.system_prompt = prompt
@@ -214,13 +180,7 @@ class OllamaLLM(BaseLLM):
         }
 
 
-# ─────────────────────────────────────────
-# REGISTER INTO FACTORY
-# ─────────────────────────────────────────
-
-# Plug OllamaLLM into the shared factory so both providers
-# are accessible from one place: LLMFactory.get("ollama")
+# Register into shared factory
 LLMFactory.PROVIDERS["ollama"] = OllamaLLM
-
 
 __all__ = ["OllamaLLM"]

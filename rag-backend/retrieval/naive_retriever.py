@@ -7,7 +7,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from vectorstore.qdrant_store import QdrantVectorStore, BaseVectorStore
 from embeddings.embedder      import BaseEmbedder, EmbedderFactory
-from utils.parent_store       import ParentStore
 from config import TOP_K
 
 
@@ -166,12 +165,10 @@ class NaiveRetriever:
         vector_store : BaseVectorStore = None,
         embedder     : BaseEmbedder    = None,
         top_k        : int             = TOP_K,
-        parent_store : ParentStore     = None,
     ):
         self.embedder     = embedder or EmbedderFactory.get("huggingface")
         self.store        = vector_store or QdrantVectorStore(embedder=self.embedder)
-        self.top_k        = top_k
-        self.parent_store = parent_store   # ParentStore instance or None
+        self.top_k        = top_k   # ParentStore instance or None
 
         print(f"  [NAIVE] NaiveRetriever ready. top_k={top_k}")
         if parent_store:
