@@ -6,7 +6,3 @@ qdrant_local_db/
 bm25_index.pkl
 parent_store.pkl
 extracted_images/
-docker-compose.yml
-DockerFile
-.dockerignore
-nginx.conf
